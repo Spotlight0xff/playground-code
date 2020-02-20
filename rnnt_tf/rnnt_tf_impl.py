@@ -9,6 +9,7 @@ import sys
 import numpy as np
 import better_exchook
 import tensorflow as tf
+tf.debugging.set_log_device_placement(True)
 from termcolor import colored
 from ref_transduce import forward_pass, transduce_batch
 from ref_transduce import transduce as transduce_ref
@@ -427,7 +428,8 @@ def tf_forward(log_probs_input, labels_input, blank_index, debug=False, sess=Non
 #   return idxs
 
 
-def tf_forward_batched(log_probs_input, labels_input, input_lengths, label_lengths, blank_index, debug=False, sess=None):
+def tf_forward_batched(log_probs_input, labels_input, input_lengths, label_lengths, blank_index, debug=False,
+                       sess=None, timing=False):
   """
   Computes the batched forward pass of the RNN-T model.
   TODO: We also compute the gradients of the backpropagation step.
@@ -695,8 +697,8 @@ def tf_forward_batched(log_probs_input, labels_input, input_lengths, label_lengt
   # ll_tf = final_alpha[n_time-1, n_target-1] + log_probs[n_time-1, n_target-1, blank_index]
 
   # (B,): batch index -> diagonal index
-  diag_idxs = input_lengths + label_lengths - 2  # (B,)
-  diag_idxs = py_print_iteration_info("diag_idxs", diag_idxs, n, debug=debug)
+  diag_idxs = tf.constant(input_lengths + label_lengths - 2)  # (B,)
+  #diag_idxs = py_print_iteration_info("diag_idxs", diag_idxs, n, debug=debug)
   # diag_idxs = tf.map_fn(lambda i: input_lengths[i] + label_lengths[i] - 2, tf.range(n_batch))
   res_ta = tf.TensorArray(
     dtype=tf.float32,
@@ -753,10 +755,24 @@ def tf_forward_batched(log_probs_input, labels_input, input_lengths, label_lengt
   final_alpha = build_alpha_matrix(alpha_out_ta)
   init_tf = tf.compat.v1.initializers.global_variables()
   gradients_tf = tf.gradients(xs=log_probs, ys=[-ll_tf])[0]
+
   sess.run(init_tf)
+
+  tf_run_opts = {}
+  if timing:
+    run_options = tf.RunOptions(trace_level=tf.RunOptions.FULL_TRACE)
+    run_metadata = tf.RunMetadata()
+    tf_run_opts = {'options': run_options, 'run_metadata': run_metadata}
   alpha_tf, n, ll_tf, gradients_tf = sess.run([final_alpha, final_n, ll_tf, gradients_tf],
                                               feed_dict={log_probs: log_probs_input,
-                                                         labels: labels_input})
+                                                         labels: labels_input}, **tf_run_opts)
+  if timing:
+    print("Num GPUs Available: ", len(tf.config.experimental.list_physical_devices('GPU')))
+    from tensorflow.python.client import timeline
+    tl = timeline.Timeline(run_metadata.step_stats)
+    ctf = tl.generate_chrome_trace_format()
+    with open('timeline_tf_ímpl.json', 'w') as f:
+      f.write(ctf)
   return alpha_tf, ll_tf, gradients_tf
 
 
@@ -995,16 +1011,16 @@ def test_batched():
   #    [[0.0, -0.11607642141651396, 0.0],
   #     [0.0, -0.4026097829597475, 0.0],
   #     [-1.0, 0.0, 0.0]]]])
-  n_batch = 8
-  n_vocab = 30
-  max_target = 200
+  n_batch = 200
+  n_vocab = 40
+  max_target = 4
   max_input = 80
   np.random.seed(42)
   labels = np.random.randint(1, n_vocab, (n_batch, max_target-1))
-  #input_lengths = np.array([2], dtype=np.int32)
-  #label_lengths = np.array([1], dtype=np.int32)
-  input_lengths = np.random.randint(1, max_input, (n_batch,), dtype=np.int32)
-  label_lengths = np.random.randint(1, max_target-1, (n_batch,), dtype=np.int32)
+  input_lengths = np.array([max_input-1]*n_batch, dtype=np.int32)
+  label_lengths = np.array([max_target-1]*n_batch, dtype=np.int32)
+  #input_lengths = np.random.randint(1, max_input, (n_batch,), dtype=np.int32)
+  #label_lengths = np.random.randint(1, max_target-1, (n_batch,), dtype=np.int32)
   # TODO we need this, as we use reduce_max, fix it!
   #label_lengths[-1] = max_target-1
   #input_lengths[-1] = max_input
@@ -1017,10 +1033,11 @@ def test_batched():
   # alpha_ref, ll_ref = forward_pass(log_probs, labels, blank=0)
   # Note: The transduce_batch implementation is wrong, for varied-sized inputs/labels!!!
   #       it doesn't handle the varying sizes (for log-likelihood computation)
-  ll_ref, grads_ref = transduce_batch(log_probs, labels, blank=0)
-  ll_ref = -np.array(ll_ref)
-  print(colored("Reference ", "red"),
-        "implementation: log-posterior=%r, |alpha|=%.4f" % (ll_ref, 0))
+  #ll_ref, grads_ref = transduce_batch(log_probs, labels, blank=0)
+  #ll_ref = -np.array(ll_ref)
+  #print(colored("Reference ", "red"),
+  #      "implementation: log-posterior=%r, |alpha|=%.4f" % (ll_ref, 0))
+  timing = True
 
   if True:
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "returnn"))
@@ -1033,11 +1050,25 @@ def test_batched():
       costs_warprnnt_tf = rnnt_loss(log_probs_t, labels_t,
                                     input_lengths_t, label_lengths_t, blank_label=0)
       grads_warprnnt_tf = tf.gradients(costs_warprnnt_tf, [log_probs_t])[0]
+      tf_run_opts = {}
+      if timing:
+        run_options = tf.RunOptions(trace_level=tf.RunOptions.FULL_TRACE)
+        run_metadata = tf.RunMetadata()
+        tf_run_opts = {'options': run_options, 'run_metadata': run_metadata}
       costs_warprnnt, grads_warprnnt = sess.run([costs_warprnnt_tf, grads_warprnnt_tf],
                                                 feed_dict={
                                                   log_probs_t: log_probs,
                                                   labels_t: labels,
-                                                })
+                                                }, **tf_run_opts)
+
+      # Create the Timeline object, and write it to a json
+      if timing:
+        from tensorflow.python.client import timeline
+        tl = timeline.Timeline(run_metadata.step_stats)
+        ctf = tl.generate_chrome_trace_format()
+        with open('timeline_warprnnt.json', 'w') as f:
+          f.write(ctf)
+
 
       print(colored("Warp Reference", "red"),
             "implementation: log-posterior=%r, |alpha|=......, |grads|=%.4f" % (
@@ -1050,7 +1081,8 @@ def test_batched():
     alpha_tf, costs_tf, grads_tf = tf_forward_batched(log_probs, labels,
                                                       input_lengths=input_lengths,
                                                       label_lengths=label_lengths,
-                                                      blank_index=0, debug=True, sess=sess)
+                                                      blank_index=0, debug=False, sess=sess,
+                                                      timing=timing)
   grads_tf = grads_tf
   print(colored("TensorFlow", "red"),
         "implementation: log-posterior=%r, |alpha|=%.4f" % (costs_tf, np.linalg.norm(alpha_tf)))
