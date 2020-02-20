@@ -1,0 +1,3 @@
+[submodule "rnnt_tf/returnn"]
+	path = rnnt_tf/returnn
+	url = https://github.com/rwth-i6/returnn.git
