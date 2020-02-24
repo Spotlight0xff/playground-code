@@ -518,8 +518,8 @@ def tf_forward_batched(log_probs_input, labels_input, input_lengths, label_lengt
       :return:
       """
       range_mat = tf.expand_dims(tf.tile([0], [n_batch]), axis=1) + tf.expand_dims(tf.range(n_max), axis=0)
-      mask = tf.where(tf.logical_and(range_mat >= tf.expand_dims(start, axis=1),  # (B, 1)
-                                     range_mat < tf.expand_dims(start + slice_len, axis=1)),
+      mask = tf.where(tf.logical_and(tf.greater_equal(range_mat, tf.expand_dims(start, axis=1)),  # (B, 1)
+                                     tf.less(range_mat,  tf.expand_dims(start + slice_len, axis=1))),
                       tf.ones_like(range_mat),
                       tf.zeros_like(range_mat)
                       )  # (B, N)
@@ -548,7 +548,7 @@ def tf_forward_batched(log_probs_input, labels_input, input_lengths, label_lengt
       tf.greater_equal(n_tiled, min_t_u),
       tf.less(n_tiled, min_t_u + diff_t_u))
     idxs_len_b = tf.where(cond_b, min_t_u, n_tiled)
-    idxs_start_b = tf.where(tf.logical_and(cond_b, input_lens > label_lens),
+    idxs_start_b = tf.where(tf.logical_and(cond_b, tf.greater(input_lens, label_lens)),
                             n_tiled - (label_lens+1),  # T > U
                             tf.zeros_like(n_tiled),  # T < U
                             )
@@ -566,7 +566,7 @@ def tf_forward_batched(log_probs_input, labels_input, input_lengths, label_lengt
                           input_lens + (label_lens) - n_tiled,  # phase (c)
                           n_tiled)  # default-case
     idxs_len_c = py_print_iteration_info("idxs_len_c", idxs_len_c, n, debug=debug)
-    idxs_start_c = tf.where(tf.logical_and(cond_c, label_lens > input_lens),
+    idxs_start_c = tf.where(tf.logical_and(cond_c, tf.greater(label_lens,  input_lens)),
                             n_tiled - label_lens,  # U > T
                             n_tiled - min_t_u)  # T > U
 
@@ -666,11 +666,11 @@ def tf_forward_batched(log_probs_input, labels_input, input_lengths, label_lengt
     new_diagonal = py_print_iteration_info("computed", new_diagonal, n, debug=debug)
 
     # add the precomputed values
-    new_diagonal = tf.cond(n < max_target-1,
+    new_diagonal = tf.cond(tf.less(n, max_target-1),
                            lambda: tf.concat([tf.expand_dims(precomputed_row[:, n + 1], axis=1), new_diagonal], axis=1),
                            lambda: new_diagonal
                            )
-    new_diagonal = tf.cond(n < max_time-1,
+    new_diagonal = tf.cond(tf.less(n, max_time-1),
                            lambda: tf.concat([new_diagonal, tf.expand_dims(precomputed_col[:, n + 1], axis=1)], axis=1),
                            lambda: new_diagonal)
     #
@@ -709,7 +709,8 @@ def tf_forward_batched(log_probs_input, labels_input, input_lengths, label_lengt
     element_shape=(),
     name="alpha_diagonals",
   )
-  within_diag_idx = tf.where(tf.tile([max_target], [n_batch]) >= tf.tile([max_time], [n_batch]),
+  within_diag_idx = tf.where(
+    tf.greater_equal(tf.tile([max_target], [n_batch]), tf.tile([max_time], [n_batch])),
                              max_time - tf.constant(input_lengths),  # U >= T
                              max_target - tf.constant(label_lengths)-1,  # U < T
                              )  # (B,)
@@ -732,7 +733,7 @@ def tf_forward_batched(log_probs_input, labels_input, input_lengths, label_lengt
     return i+1, res_ta.write(i, ta_item[within_diag_idx[i]])  # TODO this may be wrong, check logic.
 
   i, a_ta = tf.while_loop(
-    lambda i, res_ta: i < n_batch,
+    lambda i, res_ta: tf.less(i, n_batch),
     ta_read_body, (tf.constant(0, tf.int32), res_ta)
   )
   a = a_ta.stack()
