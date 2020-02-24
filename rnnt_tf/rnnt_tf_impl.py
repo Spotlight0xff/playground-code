@@ -9,7 +9,6 @@ import sys
 import numpy as np
 import better_exchook
 import tensorflow as tf
-tf.debugging.set_log_device_placement(True)
 from termcolor import colored
 from ref_transduce import forward_pass, transduce_batch
 from ref_transduce import transduce as transduce_ref
@@ -835,58 +834,37 @@ def tf_forward_shifted(log_probs_input, labels_input, input_lengths=None, label_
   log_probs_tr = tf.transpose(log_probs, [0, 2, 1, 3])  # (B, T, U, V) -> (B, U, T, V)
   log_probs_shifted = shift_matrix(log_probs_tr, axis=1, axis_to_expand=2)  # (B, U+T+1, U, V)
 
-  def shift_matrix2d_tile(mat, axis, shift_len, dtype=tf.float32):
-    """
-    This function implements the required tiled-shift for the RNN-T implementation.
-    Basically it tiles the input matrix along a new dimension (T),
-    which is then shifted in each diagonal step.
-    e.g.
-    [[1 2 3]
-     [4 5 6]]  (B=2, U=3)
-     for T=4 will be converted to (B=2, U+T+1=8, U=3):
-     [[1 2 3]
-      [4 5 6]]  (2, 3)
-     [[2 3 0]
-      [0 4 5 6 0 0 0]]  (2, 6)
-     will be converted to (B=2,
+  def shift_matrix_2d(mat, n_time, batch_dim_axis=0, axis=1, axis_to_shift=2):
+    assert batch_dim_axis == 0
+    mat = tf.convert_to_tensor(mat)
+    shape = tf.shape(mat)
+    mat = tf.expand_dims(mat, axis=-1)  # (B, U, 1)
+    mat = tf.tile(mat, [1,1, n_time])  # (B, U, T)
+    # batch, rows
+    B, R, C = tf.meshgrid(
+        tf.range(shape[0]),  # (B,)
+        tf.range(shape[1]),  # (U,)
+        tf.range(n_time)     # (T,)
+        ,indexing='ij')
+    shifts = tf.range(shape[1])  # (T,)
+    # (B, U, T) + (1, U, 1)
+    C = C + shifts[tf.newaxis, :, tf.newaxis]
+    idxs = tf.stack([B,R, C], axis=-1)
 
-    :param mat:  (B, U)
-    :param axis:  ==1 for U
-    :param shift_len: T
-    :param dtype:
-    :return (B, T+U+1)
-    """
-    # mat: (B, T, U, V)
-    # axis_to_expand: usually U
-    # axis: usually T
-    # batch-axis has to be first
-    dim_axis = tf.shape(mat)[axis]  # U
-    n_batch = tf.shape(mat)[0]
-    shifts = tf.expand_dims(tf.cast(tf.range(shift_len), dtype=dtype), axis=0)  # (1, T)
-    shifts = tf.tile(shifts, [n_batch, 1])
-    pads = tf.zeros((n_batch, shift_len), dtype=dtype)
-    # (1, T) + (B, U) + (B, T)
-    # -> (B, 1+T+U)
-    a_ranged = tf.concat([shifts, mat, pads], axis=1)  # (B, 1+T+U)
-
-    def fn(x):  # x: (B, U+T+1, V)
-      shift = tf.cast(x[0], tf.int32)  # (B,)
-      # 1:U+1 is the original data, in front: shift as wanted, back: padding for shape
-      n = tf.pad(x[1:dim_axis+1], [  # B
-                                    [shift, shift_len + 1 - shift],  # U+T+1
-                                    ])
-      return n
-
-    t = tf.map_fn(fn, elems=tf.transpose(a_ranged, [1, 0]))  # (T+U+1, B)
-    t = tf.transpose(t, [1, 0])  # (B, T+U+1)
-    # TODO: maybe cut off the last dim (t[:,:,:-1,:], only padding?)
-    return t
+    # (B, U, T+U)
+    new_shape = [shape[0]]  # (B,)
+    new_shape.append(shape[1])
+    new_shape.append(shape[1] + n_time)
+    # idxs: (B, U, U+T, 3)
+    scat_mat = tf.scatter_nd(indices=idxs, updates=mat,
+                             shape=new_shape)
+    return scat_mat
 
   labels_in = py_print_iteration_info("labels", labels, 0, debug=debug)
-  #labels_shifted_mat = shift_matrix2d_tile(labels_in, axis=1, shift_len=max_time, dtype=tf.int32)
-  #labels_shifted_mat = py_print_iteration_info("labels_shifted_mat", labels_shifted_mat, 0, debug=debug)
-  labels_shifted_mat = tf.zeros((n_batch, max_time+max_target), dtype=tf.int32)
-  labels_shifted_mat = tf.transpose(labels_shifted_mat, (1, 0))
+  labels_shifted_mat = shift_matrix_2d(labels_in, n_time=max_time)  # (B, U, T+U)
+  labels_shifted_mat = tf.transpose(labels_shifted_mat, (2, 0, 1))
+  labels_shifted_mat = py_print_iteration_info("labels_shifted_mat", labels_shifted_mat, 0, debug=debug)
+
 
   num_diagonals = max_time + max_target - 2
 
@@ -896,7 +874,7 @@ def tf_forward_shifted(log_probs_input, labels_input, input_lengths=None, label_
     size=max_time + max_target,
     dynamic_size=True,
     infer_shape=False,
-    element_shape=(n_batch,),  # (B,)
+    element_shape=(n_batch, max_target-1),  # (B,)
     name="labels_shifted",
   )
   labels_shifted_ta = labels_shifted_ta.unstack(labels_shifted_mat)
@@ -943,7 +921,7 @@ def tf_forward_shifted(log_probs_input, labels_input, input_lengths=None, label_
     # alpha(t-1,u) + logprobs(t-1, u)
     # alpha_blank      + lp_blank
 
-    prev_max_diag_len = tf.minimum(max_target, n-1)
+    prev_max_diag_len = tf.minimum(max_target-1, n-1)
     prev_diagonal = alpha_ta.read(n-1)[:, :prev_max_diag_len]  # (B, n-1)
     lp_diagonal = log_probs_ta.read(n)[:, :prev_max_diag_len, :]  # (B, U|n, V)
     lp_diagonal = py_print_iteration_info("lp_diagonal", lp_diagonal, n, debug=debug)
@@ -966,16 +944,29 @@ def tf_forward_shifted(log_probs_input, labels_input, input_lengths=None, label_
     alpha_y = tf.concat([alpha_y, tf.tile([[tf.constant(NEG_INF)]], [n_batch, 1])], axis=1)
     alpha_y = py_print_iteration_info("alpha(y)", alpha_y, n, debug=debug)
 
-    labels_shifted = labels_shifted_ta.read(n)  # (B,)
+    labels_maxlen = tf.minimum(max_target, n-1)
+    labels_shifted = labels_shifted_ta.read(n)
     labels_shifted = py_print_iteration_info("labels_shifted", labels_shifted, n, debug=debug)
-    lp_y_idxs = tf.stack([
-      tf.range(n_batch),  # (B,)
-      labels_shifted,  # (B,)
-    ], axis=-1)  # (B, 2)
+    labels_shifted = labels_shifted[:, :prev_max_diag_len]  # (B,U)
+    labels_shifted = py_print_iteration_info("labels_shifted2", labels_shifted, n, debug=debug)
+    B, R = tf.meshgrid(
+      tf.range(tf.shape(labels_shifted)[0]),
+      tf.range(tf.shape(labels_shifted)[1]),
+      #tf.range(tf.shape(labels_shifted)[1]),
+      indexing='ij'
+    )
+    #lp_y_idxs = tf.stack([
+    #  tf.range(n_batch),  # (B,)
+    #  labels_shifted,  # (B,)
+    #], axis=-1)  # (B, 2)
+    lp_y_idxs = tf.stack([B, R, labels_shifted], axis=-1)  # (B, U, V, 3)  TODO: why??
+    #lp_y_idxs = tf.transpose(lp_y_idxs, [1,0,2])  # (B, U, 2)
     # (B, U, V) -> (B, V, U)
     lp_diag_tr = tf.transpose(lp_diagonal, (0, 2, 1))
     # gather from (B, V, U) -> (B, U)
-    lp_y = tf.gather_nd(lp_diag_tr, lp_y_idxs)
+    lp_y = tf.gather_nd(lp_diag_tr, lp_y_idxs)  # (B, U)
+    #lp_y = tf.zeros((n_batch, n, max_target))
+    # (B, U) ; (B, 1) -> (B, U+1)
     lp_y = tf.concat([lp_y, tf.tile([[tf.constant(NEG_INF)]], [n_batch, 1])], axis=1)
     # lp_y = lp_y[:, :n]  # (B, U) -> (B, n)
     #lp_y = tf.zeros_like(alpha_y)
@@ -1323,8 +1314,8 @@ def test_batched():
   max_target = 5
   max_input = 8
   np.random.seed(42)
-  #labels = np.random.randint(1, n_vocab, (n_batch, max_target-1))
-  labels = np.zeros((n_batch, max_target - 1))  # TODO DEBUG!!!
+  labels = np.random.randint(1, n_vocab, (n_batch, max_target-1))
+  #labels = np.zeros((n_batch, max_target - 1))  # TODO DEBUG!!!
   input_lengths = np.array([max_input-1]*n_batch, dtype=np.int32)
   label_lengths = np.array([max_target-1]*n_batch, dtype=np.int32)
   #input_lengths = np.random.randint(1, max_input, (n_batch,), dtype=np.int32)
