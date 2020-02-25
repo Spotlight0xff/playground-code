@@ -1183,7 +1183,7 @@ def test_sizes():
     for n_target in range(2, 12):
       acts = np.random.random_sample((n_time, n_target, n_vocab))
       labels = np.random.randint(1, n_vocab-1, (n_target-1,))
-      test_impl(f"test_sizes: T={n_time}, U={n_target}", acts, labels, blank_index)
+      test_impl("test_sizes: T=%d, U=%d" % (n_time, n_target), acts, labels, blank_index)
 
 
 def test_random():
