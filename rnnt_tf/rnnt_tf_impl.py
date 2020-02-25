@@ -1136,7 +1136,7 @@ def test_impl(name, acts, labels, blank_index, input_lens=None, label_lens=None,
   if with_warprnnt:
     np.testing.assert_almost_equal(ll_tf, costs_warprnnt, decimal=5)
     print("TF vs Warp: log posterior", colored("MATCH", "green"))
-    np.testing.assert_almost_equal(grads_tf, grads_warprnnt, decimal=5)
+    np.testing.assert_almost_equal(grads_tf, grads_warprnnt, decimal=4)
     print("TF vs Warp: gradients", colored("MATCH", "green"))
   print()
 
@@ -1304,12 +1304,22 @@ def test_batched():
   #max_target = 3
   #n_vocab = 5
   np.random.seed(42)
-  labels = np.random.randint(1, n_vocab, (n_batch, max_target))
+  labels = np.random.randint(1, n_vocab, (n_batch, max_target-1))
   input_lengths = np.random.randint(1, max_input, (n_batch,), dtype=np.int32)
   #input_lengths = np.tile([max_input-1], [n_batch])
   #label_lengths = np.tile([max_target-1], [n_batch])
   label_lengths = np.random.randint(1, max_target - 1, (n_batch,), dtype=np.int32)
   acts = np.random.normal(0, 1, (n_batch, max_input, max_target, n_vocab))
+  #
+  # n_batch = 4
+  # max_input = 80
+  # max_target = 20
+  # n_vocab = 50
+  # np.random.seed(42)
+  # labels = np.random.randint(1, n_vocab, (n_batch, max_target - 1))
+  # input_lengths = np.random.randint(1, max_input, (n_batch,), dtype=np.int32)
+  # label_lengths = np.random.randint(1, max_target - 1, (n_batch,), dtype=np.int32)
+  # acts = np.random.normal(0, 1, (n_batch, max_input, max_target, n_vocab))
 
   test_impl("batched", acts, labels, 0, input_lengths, label_lengths, with_warprnnt=True)
 
@@ -1319,10 +1329,12 @@ if __name__ == '__main__':
   import better_exchook
   better_exchook.install()
 
+  np.random.seed(42)
+
   test_small()
-  # test_size_u_greater_t()
-  # test_size_t_greater_u()
-  # test_size_t_equal_u()
-  # test_random()
+  test_size_u_greater_t()
+  test_size_t_greater_u()
+  test_size_t_equal_u()
+  test_random()
   test_batched()
-  # test_sizes()
+  test_sizes()
