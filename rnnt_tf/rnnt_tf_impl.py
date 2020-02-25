@@ -54,12 +54,19 @@ def numpy_forward(log_probs, labels, blank_index, debug=False):
   """Forward calculation of the RNN-T loss."""
   n_time, n_target, n_vocab = log_probs.shape
   alpha = np.zeros((n_time, n_target))  # 1 in log-space
+  print("a = alpha[t-1, u] + log_probs[t - 1, u, blank_index]")
+  print("b = alpha[t, u - 1] + log_probs[t, u - 1, labels[u - 1]]")
+  print("alpha[t,u] = LSE(a,b)")
   if debug:
     print("U=%d, T=%d, V=%d" % (n_target, n_time, n_vocab))
   for t in range(1, n_time):  # first row
     alpha[t, 0] = alpha[t - 1, 0] + log_probs[t - 1, 0, blank_index]
+    print('t=%2d u= 0: alpha[%d, 0] + log_probs[%d, 0, %d] = %.3f + %.3f = %.3f' % (
+      t, t-1, t-1, blank_index, alpha[t - 1, 0], log_probs[t - 1, 0, blank_index], alpha[t, 0]))
   for u in range(1, n_target):  # first column
     alpha[0, u] = alpha[0, u - 1] + log_probs[0, u - 1, labels[u - 1]]
+    print('t= 0 u=%2d: alpha[0, %d] + log_probs[0, %d, labels[%d]=%d] = %.3f + %.3f = %.3f' % (
+      u, u-1, u-1, u-1, labels[u - 1], alpha[0, u - 1], log_probs[0, u - 1, labels[u - 1]], alpha[0, u]))
 
   for t in range(1, n_time):
     for u in range(1, n_target):
