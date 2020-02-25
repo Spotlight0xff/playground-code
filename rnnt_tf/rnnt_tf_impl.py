@@ -1105,7 +1105,7 @@ def test_impl(name, acts, labels, blank_index, input_lens=None, label_lens=None,
 
 
   if with_warprnnt:
-    sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "returnn"))
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "returnn"))
     from extern.HawkAaronWarpTransducer import rnnt_loss
     with sess.as_default():
       input_lengths_t = tf.constant(input_lens, dtype=tf.int32)  # (B,)
