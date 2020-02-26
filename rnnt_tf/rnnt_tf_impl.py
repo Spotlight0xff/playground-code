@@ -755,7 +755,7 @@ def tf_forward_batched(log_probs_input, labels_input, input_lengths, label_lengt
   return alpha_tf, ll_tf, gradients_tf
 
 
-def tf_forward_shifted(log_probs_np, labels_np, input_lengths_np=None, label_lengths_np=None, blank_index=0, debug=False,
+def tf_forward_shifted(log_probs, labels, input_lengths=None, label_lengths=None, blank_index=0, debug=False,
                        sess=None, timing=False):
   """
   Computes the batched forward pass of the RNN-T model.
@@ -771,15 +771,18 @@ def tf_forward_shifted(log_probs_np, labels_np, input_lengths_np=None, label_len
   :return:
   """
   """Pure TF implementation of the RNN-T loss."""
-  n_batch, max_time, max_target, n_vocab = log_probs_np.shape
-  if debug:
-    print("B=%d, T=%d, U=%d, V=%d" % (n_batch, max_time, max_target, n_vocab))
-  assert len(labels_np.shape) == 2  # (B, U)
+  #n_batch, max_time, max_target, n_vocab = log_probs_np.shape
+  #if debug:
+  #  print("B=%d, T=%d, U=%d, V=%d" % (n_batch, max_time, max_target, n_vocab))
+  #assert len(labels_np.shape) == 2  # (B, U)
 
-  labels = tf.compat.v1.placeholder(tf.int32, [None, None])
-  log_probs = tf.compat.v1.placeholder(tf.float32, [None, max_time, max_target, n_vocab])
-  input_lengths = tf.compat.v1.placeholder(tf.int32, [None])
-  label_lengths = tf.compat.v1.placeholder(tf.int32, [None])
+
+  shape = tf.shape(log_probs)
+  n_batch = shape[0]
+  max_time = shape[1]
+  max_target = shape[2]
+  n_vocab = shape[3]
+  #n_batch, max_time, max_target, n_vocab = log_probs_np.shape
 
   def shift_logprobs(mat, axis, axis_to_expand):
     """
@@ -862,7 +865,8 @@ def tf_forward_shifted(log_probs_np, labels_np, input_lengths_np=None, label_len
     size=max_time + max_target,
     dynamic_size=True,
     infer_shape=False,
-    element_shape=(n_batch, max_target-1),  # (B,)
+    #element_shape=(n_batch, max_target-1),  # (B,)
+    element_shape=(None, None),
     name="labels_shifted",
   )
   labels_shifted_ta = labels_shifted_ta.unstack(labels_shifted_mat)
@@ -885,7 +889,8 @@ def tf_forward_shifted(log_probs_np, labels_np, input_lengths_np=None, label_len
     size=num_diagonals,
     dynamic_size=False,
     infer_shape=False,
-    element_shape=(n_batch, None,),  # (B, n)
+    #element_shape=(n_batch, None,),  # (B, n)
+    element_shape=(None, None,),  # (B, n)
     name="alpha_diagonals",
   )
   alpha_ta = alpha_ta.write(1, tf.zeros((n_batch, 2)))
@@ -980,7 +985,7 @@ def tf_forward_shifted(log_probs_np, labels_np, input_lengths_np=None, label_len
   def ta_read_body(i, res_ta):
     ta_item = alpha_out_ta.read(diag_idxs[i])[i]
 
-    var_print = tf.print("FINAL", "\t", "i=", i, "T=", tf.constant(max_time), "U=", tf.constant(max_target),
+    var_print = tf.print("FINAL", "\t", "i=", i, "T=", max_time, "U=", max_target,
                          "T'=", input_lengths[i],
                          "U'=", label_lengths[i],
                          "diag_idx=", diag_idxs[i],
@@ -1003,39 +1008,12 @@ def tf_forward_shifted(log_probs_np, labels_np, input_lengths_np=None, label_len
     tf.tile([blank_index], [n_batch]),
   ], axis=-1)  # (N, 3)
   ll_tf = a_ta.stack() + tf.gather_nd(log_probs, indices)
+  return ll_tf
 
-  # this is not needed for the final implementation,
-  # but for debugging we can stitch together the alpha matrix from the diagonals
-  def build_alpha_matrix(alpha_diagonals):
-    alpha_matrix = tf.zeros((n_batch, max_time, max_target))
-    return alpha_matrix
-  final_alpha = build_alpha_matrix(alpha_out_ta)
-  init_tf = tf.compat.v1.initializers.global_variables()
-  gradients_tf = tf.gradients(xs=log_probs, ys=[-ll_tf])[0]
-
-  sess.run(init_tf)
-
-  tf_run_opts = {}
-  if timing:
-    run_options = tf.RunOptions(trace_level=tf.RunOptions.FULL_TRACE)
-    run_metadata = tf.RunMetadata()
-    tf_run_opts = {'options': run_options, 'run_metadata': run_metadata}
-  alpha_tf, n, ll_tf, gradients_tf = sess.run([final_alpha, final_n, ll_tf, gradients_tf],
-                                              feed_dict={log_probs: log_probs_np,
-                                                         labels: labels_np,
-                                                         input_lengths: input_lengths_np,
-                                                         label_lengths: label_lengths_np}, **tf_run_opts)
-  if timing:
-    print("Num GPUs Available: ", len(tf.config.experimental.list_physical_devices('GPU')))
-    from tensorflow.python.client import timeline
-    tl = timeline.Timeline(run_metadata.step_stats)
-    ctf = tl.generate_chrome_trace_format()
-    with open('timeline_tf_impl.json', 'w') as f:
-      f.write(ctf)
-  return alpha_tf, ll_tf, gradients_tf
+  #return ll_tf, gradients_tf
 
 
-def test_impl(name, acts, labels, blank_index, with_warprnnt=True):
+def test_impl(name, acts, labels, blank_index, with_warprnnt=True, debug=False, timing=False):
   """
   runs the different implementations on the same data, comparing them.
 
@@ -1088,10 +1066,24 @@ def test_impl(name, acts, labels, blank_index, with_warprnnt=True):
         "implementation: log-posterior=%.4f, |alpha|=%.4f" % (ll_np, np.linalg.norm(alpha_np)))
 
   with sess.as_default():
-    alpha_tf, ll_tf, grads_tf = tf_forward_shifted(log_probs, labels, blank_index=blank_index, debug=True, sess=sess)
+    labels_ph = tf.compat.v1.placeholder(tf.int32, [None, None])
+    log_probs_ph = tf.compat.v1.placeholder(tf.float32, [None, None, None, None])
+    input_lengths_ph = tf.compat.v1.placeholder(tf.int32, [None])
+    label_lengths_ph = tf.compat.v1.placeholder(tf.int32, [None])
+    costs_ph = tf_forward_shifted(log_probs_ph, labels_ph,
+                                 input_lengths=input_lengths_ph,
+                                 label_lengths=label_lengths_ph,
+                                 blank_index=0, debug=False, sess=sess,
+                                 timing=timing)
+    grads_ph = tf.gradients(xs=log_probs_ph, ys=[-costs_ph])[0]
+    costs_tf, grads_tf = sess.run([costs_ph, grads_ph],
+                                      feed_dict={log_probs_ph: log_probs,
+                                                 labels_ph: labels,
+                                                 input_lengths_ph: input_lengths,
+                                                 label_lengths_ph: label_lengths})
   print(colored("TensorFlow    ", "red"),
         "implementation: log-posterior=%.4f, |alpha|=%.4f, |grads|=%.4f" % (
-        ll_tf, np.linalg.norm(alpha_tf), np.linalg.norm(grads_tf[0])))
+        costs_tf, np.linalg.norm(grads_tf)))
 
   # Do all the tests (numpy vs ref vs TF), for score, alpha, and grads (TF/Ref)
   np.testing.assert_allclose(alpha_np, alpha_ref)
@@ -1275,7 +1267,7 @@ def test_batched():
   max_target = 20
   n_vocab = 50
   np.random.seed(42)
-  labels = np.random.randint(1, n_vocab, (n_batch, max_target-1))
+  labels = np.random.randint(1, n_vocab, (n_batch, max_target - 1))
   input_lengths = np.random.randint(1, max_input, (n_batch,), dtype=np.int32)
   label_lengths = np.random.randint(1, max_target - 1, (n_batch,), dtype=np.int32)
   acts = np.random.normal(0, 1, (n_batch, max_input, max_target, n_vocab))
@@ -1329,14 +1321,24 @@ def test_batched():
   #      "implementation: log-posterior=%.4f, |alpha|=%.4f" % (ll_np, np.linalg.norm(alpha_np)))
 
   with sess.as_default():
-    alpha_tf, costs_tf, grads_tf = tf_forward_shifted(log_probs, labels,
-                                                      input_lengths_np=input_lengths,
-                                                      label_lengths_np=label_lengths,
-                                                      blank_index=0, debug=False, sess=sess,
-                                                      timing=timing)
-  grads_tf = grads_tf
+    labels_ph = tf.compat.v1.placeholder(tf.int32, [None, None])
+    log_probs_ph = tf.compat.v1.placeholder(tf.float32, [None, None, None, None])
+    input_lengths_ph = tf.compat.v1.placeholder(tf.int32, [None])
+    label_lengths_ph = tf.compat.v1.placeholder(tf.int32, [None])
+    costs_ph = tf_forward_shifted(log_probs_ph, labels_ph,
+                                 input_lengths=input_lengths_ph,
+                                 label_lengths=label_lengths_ph,
+                                 blank_index=0, debug=False, sess=sess,
+                                 timing=timing)
+    grads_ph = tf.gradients(xs=log_probs_ph, ys=[-costs_ph])[0]
+    costs_tf, grads_tf = sess.run([costs_ph, grads_ph],
+                                      feed_dict={log_probs_ph: log_probs,
+                                                 labels_ph: labels,
+                                                 input_lengths_ph: input_lengths,
+                                                 label_lengths_ph: label_lengths})
+
   print(colored("TensorFlow", "red"),
-        "implementation: log-posterior=%r, |alpha|=%.4f" % (costs_tf, np.linalg.norm(alpha_tf)))
+        "implementation: log-posterior=%r, |alpha|=%.4f" % (costs_tf, np.linalg.norm(grads_tf)))
 
   # Check against expected values
   # np.testing.assert_allclose(alpha_tf, alpha_ref)
