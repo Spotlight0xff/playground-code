@@ -109,72 +109,115 @@ def numpy_forward_shifted_batched(log_probs, labels, blank_index, input_lens, la
     print("labels: (B=%d, U-1=%d)" % (n_batch, labels.shape[1]))
 
   with tf.Session().as_default():
-    shifted_labels_tf = tf_shift_matrix_2d(tf.convert_to_tensor(labels), n_time=max_time)  # (B, U-1, T+U-1)
+    shifted_labels_tf = tf_shift_matrix_2d(tf.convert_to_tensor(labels), n_time=max_time+1)  # (B, U-1, T+U-1)
     shifted_labels_tf = tf.transpose(shifted_labels_tf, (2, 0, 1))  # (T+U+1, B, U-1)
-    tf_shifted = tf_shift_logprobs(tf.convert_to_tensor(tf.transpose(log_probs, [0, 2, 1, 3])), axis=1, axis_to_expand=2)
+    tf_shifted = tf_shift_logprobs(tf.cast(tf.transpose(log_probs, [0, 2, 1, 3]), dtype=tf.float32), axis=1, axis_to_expand=2)
     shifted_logprobs, shifted_labels = sess.run([tf_shifted, shifted_labels_tf])
     shifted_logprobs = np.transpose(shifted_logprobs, (0, 2, 1, 3))  # (B, U, U+T+1, V) -> (B, U+T+1, U, V)
-  print(shifted_logprobs.shape, shifted_logprobs)
-  assert shifted_logprobs.shape == (n_batch, max_time+max_target+1, max_target, n_vocab)
-  assert shifted_labels.shape == (max_time+max_target-1, n_batch, max_target-1)
+  assert shifted_logprobs.shape == (n_batch, max_time+max_target, max_target, n_vocab)
+  # assert shifted_labels.shape == (max_time+max_target, n_batch, max_target-1)
   # assert n_batch == 1
+  if debug:
+    print("labels", shifted_labels.shape)
+    print(shifted_labels)
+    print("\n")
+    print("log-probs")
+    for n in range(2, max_time+max_target):
+      print("lp(blank) for n=%d" % n, shifted_logprobs[0, n - 2, ..., 0])
+      #print("lp(1) for n=%d" % n, shifted_logprobs[0, n-2, ..., 1])
+      #print("lp(2) for n=%d" % n, shifted_logprobs[0, n-2, ..., 2])
 
   def print_debug(n, *vars):
+    """Some basic debug information printing."""
     if debug:
       print("[n=%2d]" % n, *vars)
   # alpha diagonals
-  alphas = [[], np.zeros((n_batch, 2))]
+  alphas = [[], np.zeros((n_batch, 1))]
 
   for n in range(2, max_time+max_target):
-    prev_max_diag_len = min(max_target-1, n-1)
+    #prev_max_diag_len = min(max_target-1, n-1)
 
     # lp_diagonal = log_probs_ta.read(n - 2)[:, :prev_max_diag_len, :]  # (B, U|n, V)
-    lp_diagonal = shifted_logprobs[:, n-2, :prev_max_diag_len]  # (U-1|n-1, V)
+    # actually previous one.
+    lp_diagonal = shifted_logprobs[:, n-2, :n-1]  # (n-1, V)
     print_debug(n, "lp_diagonal", lp_diagonal)
 
-    labels_n = shifted_labels[n, :]  # (U-1,)
-    print_debug(n, "labels", labels_n)
+    # labels_n = shifted_labels[n, :]  # (U-1,)
+    # print_debug(n, "labels", labels_n)
 
-    prev_diagonal = alphas[n-1][:, :prev_max_diag_len]
+    prev_diagonal = alphas[n-1][:, :n]
     print_debug(n, "prev_diagonal", prev_diagonal)
 
+    # another fix!!
+    #if n > max_time:
+    #  alpha_blank = prev_diagonal[:, 1:]
+    #else:
     alpha_blank = prev_diagonal  # (B, N)
     alpha_blank = np.concatenate([alpha_blank, np.tile([[NEG_INF]], [n_batch, 1])], axis=1)
-    print_debug(n, "alpha_blank", alpha_blank)
     # alpha_blank = tf.concat([alpha_blank, tf.tile([[tf.constant(NEG_INF)]], [n_batch, 1])], axis=1)
 
     # (B, U, V) -> (B, U)
+    # this is one fix!! `n-2:` instead of `:` to correctly use the shifted log-probs
     lp_blank = lp_diagonal[:, :, blank_index]  # (B, U)
     lp_blank = np.concatenate([lp_blank, np.tile([[NEG_INF]], [n_batch, 1])], axis=1)
-    print_debug(n, "lp_blank", lp_blank)
     # lp_blank = tf.concat([lp_blank, tf.tile([[tf.constant(NEG_INF)]], [n_batch, 1])], axis=1)
     # (B,N-1) ; (B,1) ->  (B, N)
+    #if n == 2:
+    #  alpha_y = prev_diagonal
+    #else:
+    #  alpha_y = prev_diagonal[:, 1:]
     alpha_y = prev_diagonal
+    #if n <= min(max_time, max_target):  # still in phase (a)
     alpha_y = np.concatenate([np.tile([[NEG_INF]], [n_batch, 1]), alpha_y], axis=1)
-    print_debug(n, "alpha_y", alpha_y)
+    if n > (max_time-1) + (max_target-1):  # phase (c), cut off top-right
+      alpha_y = alpha_y[:, :(max_time-1) + (max_target-1)]
+      lp_blank = lp_blank[:, :(max_time-1) + (max_target-1)]
+      alpha_blank = alpha_blank[:, :(max_time - 1) + (max_target - 1)]
 
     # labels_maxlen = tf.minimum(max_target - 1, n - 1)
     labels_maxlen = min(max_target - 1, n - 1)
     # labels_shifted = labels_shifted_ta.read(n - 1)
-    labels_shifted = shifted_labels[n-1, :, :labels_maxlen]  # (max_time+max_target-1, n_batch, max_target-1)
+    # labels_shifted = shifted_labels[n-1, :, :labels_maxlen]  # (max_time+max_target-1, n_batch, max_target-1)
+
     # labels_shifted = labels_shifted[:, :labels_maxlen]  # (B,U)
+    #start_slice = 0
+    #if n > min(max_target, max_time):
+    #  start_slice = n - min(max_target, max_time) - 1
+    #labels_shifted = labels[:, start_slice:end_slice]
+    #labels_shifted = shifted_labels[n - 1, :, start_slice:labels_maxlen]  # (max_time+max_target-1, n_batch, max_target-1)
+    labels_shifted = shifted_labels[n - 1, :, :min(n-1, max_target-1)]  # (max_time+max_target-1, n_batch, max_target-1)
+    # pad top-right end of diagonal
+    #if n >= min(max_target, max_time) + max_target - 1:  # in phase (c), U critical
+    #  labels_shifted = np.pad(labels_shifted, [[0, 0],
+                                              # [0, n - max_target]])
     print_debug(n, "labels_shifted", labels_shifted)
     B, R = np.meshgrid(
       np.arange(np.shape(labels_shifted)[0]),  # B
       np.arange(np.shape(labels_shifted)[1]),  # U-1, TODO: maybe +1?
       indexing='ij'
     )
-    lp_y_idxs = np.stack([B, R, labels_shifted], axis=-1)  # (B, V, 3)
+    print_debug(n, "B:", B, "R", R)
+    # lp_y_idxs = np.stack([B, R, labels_shifted], axis=-1)  # (B, V, 3)
     # lp_y_idxs = py_print_iteration_info("lp_y_idxs", lp_y_idxs, n, debug=debug)
-    lp_y = lp_diagonal[B, R, labels_shifted]  #
+
+    #lp_y = lp_diagonal[:, start_slice:]
+    lp_y = lp_diagonal[B, R, labels_shifted]
     # lp_y = tf.gather_nd(lp_diagonal[:, :, :], lp_y_idxs)  # (B, U)
     # (B, U) ; (B, 1) -> (B, U+1)
     lp_y = np.concatenate([np.tile([[NEG_INF]], [n_batch, 1]), lp_y], axis=1)
-    print_debug(n, "lp_y", lp_y)
+
 
     # all should have shape (B, n)
+    print_debug(n, colored("lp_blank", "green"), lp_blank)
+    print_debug(n, colored("alpha_blank", "green"), alpha_blank)
     blank = alpha_blank + lp_blank
+    print_debug(n, colored("blank", "green"), blank)
+
+    print_debug(n, "labels_shifted", labels_shifted)
+    print_debug(n, colored("lp_y", "red"), lp_y)
+    print_debug(n, colored("alpha_y", "red"), alpha_y)
     y = alpha_y + lp_y
+    print_debug(n, colored("y", "red"), y)
     # red_op = np.stack([blank, y], axis=0)  # (2, B, N)
     # print_debug(n, "red-op", red_op)
     new_diagonal = np.logaddexp(blank, y)  # (B, N)
@@ -183,6 +226,7 @@ def numpy_forward_shifted_batched(log_probs, labels, blank_index, input_lens, la
     print_debug(n, "new_diagonal", new_diagonal)
     alphas.append(new_diagonal)  # s.t. alphas[n] == new_diagonal
     # new_diagonal = py_print_iteration_info("new_diagonal", new_diagonal, n, debug=debug)
+    print("\n")
 
 
 
@@ -195,14 +239,18 @@ def numpy_forward_shifted_batched(log_probs, labels, blank_index, input_lens, la
   # (B,): batch index -> index within diagonal
   # We need to handle the U>T case for each example.
   within_diag_idx = np.minimum(input_lens, label_lens)
-  within_diag_idx = np.where(label_lens > input_lens,
-                             label_lens,
-                             within_diag_idx)
+  #within_diag_idx = np.where(max_target > max_time,
+  #                           max_time - input_lens,
+  #                           max_target - label_lens)
 
   for i in range(n_batch):
-    ta_item = alphas[diag_idxs[i]]
+    print("i=%d, diag_idx=%d, within_diag_idx=%d" % (i, diag_idxs[i], within_diag_idx[i]))
+    ta_item = alphas[diag_idxs[i]]  # (B, N)
 
-    nll = ta_item[within_diag_idx[i]] + log_probs[i, input_lens[i], label_lens[i], blank_index]
+    a = ta_item[i, within_diag_idx[i]]
+    b = log_probs[i, input_lens[i]-1, label_lens[i], blank_index]
+    print("FINAL i=%d" % i, "a=%.3f + b=%.3f" % (a, b))
+    nll = a + b
     list_nll.append(nll)
   return np.array(list_nll)  # (B,)
 
@@ -419,7 +467,7 @@ def numpy_forward_shifted_batched(log_probs, labels, blank_index, input_lens, la
 #     # phase (a): diagonals are "growing"
 #     phase_a_end = tf.cond(tf.greater(n_target, n_time),
 #                           lambda: n_time-1,
-#                           lambda: tf.add(n_target, -1))
+#                           lambda: n_target -1)
 #     # phase (b): diagonals are "stagnant" (maybe phase_a_end==phase_b_end)
 #     phase_b_end = tf.cond(tf.greater(n_target, n_time),
 #                           lambda: n_target - 1,
@@ -894,13 +942,13 @@ def tf_shift_logprobs(mat, axis, axis_to_expand):
     n = tf.pad(x[:, 1:U + 1, :], [[0, 0],  # B
                                   [shift, T + 1 - shift],  # U+T+1
                                   [0, 0]  # V
-                                  ])
+                                  ], constant_values=NEG_INF)
     return n
 
   t = tf.map_fn(fn, elems=tf.transpose(a_ranged, [1, 0, 2, 3]))
   t = tf.transpose(t, [1, 0, 2, 3])
   # TODO: maybe cut off the last dim (t[:,:,:-1,:], only padding?)s
-  return t
+  return t[:, :, :-1, :]
 
 
 def tf_shift_matrix_2d(mat, n_time):
@@ -926,6 +974,7 @@ def tf_shift_matrix_2d(mat, n_time):
                            shape=new_shape)
   return scat_mat
 
+
 def tf_forward_shifted(log_probs, labels, input_lengths=None, label_lengths=None, blank_index=0, debug=False):
   """
   Computes the batched forward pass of the RNN-T model.
@@ -937,18 +986,16 @@ def tf_forward_shifted(log_probs, labels, input_lengths=None, label_lengths=None
   :param tf.Tensor label_lengths: (B,) length of labels
   :param int blank_index: index of the blank symbol in the vocabulary
   :param bool debug: enable verbose logging
-  :param tf.Session sess:
   :return:
   """
   """Pure TF implementation of the RNN-T loss."""
   shape = tf.shape(log_probs)
-  n_batch = shape[0]
-  max_time = shape[1] + 1
-  max_target = shape[2]
+  n_batch = shape[0]     # B
+  max_time = shape[1]    # T TODO: "+ 1"?
+  max_target = shape[2]  # U
 
   log_probs_tr = tf.transpose(log_probs, [0, 2, 1, 3])  # (B, T, U, V) -> (B, U, T, V)
   log_probs_shifted = tf_shift_logprobs(log_probs_tr, axis=1, axis_to_expand=2)  # (B, U+T+1, U, V)
-
 
   labels_in = py_print_iteration_info("labels", labels, 0, debug=debug)
   labels_shifted_mat = tf_shift_matrix_2d(labels_in, n_time=max_time)  # (B, U-1, T+U-1)
@@ -956,7 +1003,7 @@ def tf_forward_shifted(log_probs, labels, input_lengths=None, label_lengths=None
   labels_shifted_mat = py_print_iteration_info("labels_shifted_mat", labels_shifted_mat, 0, debug=debug)
 
   # 2 = 1 for starting at n=1, 1 for label lengths+1==U
-  num_diagonals = max_time + max_target - 1
+  num_diagonals = max_time + max_target
 
   labels_shifted_ta = tf.TensorArray(
     dtype=tf.int32,
@@ -1167,7 +1214,8 @@ def test_impl(name, acts, labels, blank_index, input_lens=None, label_lens=None,
                                            input_lens=input_lens, label_lens=label_lens)
   print_results("Numpy", costs_np, np.zeros_like(grads_ref))
   np.testing.assert_almost_equal(costs_np, costs_ref, decimal=5)
-  print("TF vs warp: log posterior", colored("MATCH", "green"))
+  print("numpy shifted vs reference: log posterior", colored("MATCH", "green"))
+  return
 
 
   with sess.as_default():
@@ -1223,11 +1271,11 @@ def test_small():
   n_time = 2
   n_target = 3
   n_vocab = 5
-  acts = np.array([0.1, 0.6, 0.1, 0.1, 0.1, 0.1,
-                   0.1, 0.6, 0.1, 0.1, 0.1, 0.1,
-                   0.2, 0.8, 0.1, 0.1, 0.6, 0.1,
-                   0.1, 0.1, 0.1, 0.1, 0.2, 0.1,
-                   0.1, 0.7, 0.1, 0.2, 0.1, 0.1], dtype=np.float32).reshape((n_time, n_target, n_vocab))
+  acts = np.array([0.1, 0.5, 0.3, 0.2, 0.1, 0.2,
+                   0.1, 0.4, 0.2, 0.2, 0.1, 0.1,
+                   0.2, 0.4, 0.1, 0.3, 0.6, 0.3,
+                   0.2, 0.1, 0.05, 0.1, 0.2, 0.1,
+                   0.1, 0.7, 0.1, 0.2, 0.1, 0.4], dtype=np.float32).reshape((n_time, n_target, n_vocab))
 
   labels = np.array([1, 2])
   test_impl("test_small", acts, labels, blank_index)
@@ -1393,5 +1441,5 @@ if __name__ == '__main__':
   #test_size_t_greater_u()
   #test_size_t_equal_u()
   #test_random()
-  test_batched()
+  #test_batched()
   #test_sizes()
