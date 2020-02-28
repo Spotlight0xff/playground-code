@@ -138,7 +138,7 @@ def numpy_forward_shifted_batched(log_probs, labels, blank_index, input_lens, la
 
     # lp_diagonal = log_probs_ta.read(n - 2)[:, :prev_max_diag_len, :]  # (B, U|n, V)
     # actually previous one.
-    lp_diagonal = shifted_logprobs[:, n-2, :n-1]  # (n-1, V)
+    lp_diagonal = shifted_logprobs[:, n-2, :n-1]  # (B, n-1, V)
     print_debug(n, "lp_diagonal", lp_diagonal)
 
     # labels_n = shifted_labels[n, :]  # (U-1,)
@@ -255,12 +255,14 @@ def numpy_forward_shifted_batched(log_probs, labels, blank_index, input_lens, la
   #                           max_target - label_lens)
 
   for i in range(n_batch):
-    print("i=%d, diag_idx=%d, within_diag_idx=%d" % (i, diag_idxs[i], within_diag_idx[i]))
+
     ta_item = alphas[diag_idxs[i]]  # (B, N)
 
     a = ta_item[i, within_diag_idx[i]]
     b = log_probs[i, input_lens[i]-1, label_lens[i], blank_index]
-    print("FINAL i=%d" % i, "a=%.3f + b=%.3f" % (a, b))
+    if debug:
+      print("FINAL i=%d, diag_idx=%d, within_diag_idx=%d" % (i, diag_idxs[i], within_diag_idx[i]))
+      print("FINAL i=%d" % i, "a=%.3f + b=%.3f" % (a, b))
     nll = a + b
     list_nll.append(nll)
   return np.array(list_nll)  # (B,)
@@ -953,7 +955,7 @@ def tf_shift_logprobs(mat, axis, axis_to_expand):
     n = tf.pad(x[:, 1:U + 1, :], [[0, 0],  # B
                                   [shift, T + 1 - shift],  # U+T+1
                                   [0, 0]  # V
-                                  ], constant_values=NEG_INF)
+                                  ], constant_values=0)
     return n
 
   t = tf.map_fn(fn, elems=tf.transpose(a_ranged, [1, 0, 2, 3]))
@@ -1002,14 +1004,14 @@ def tf_forward_shifted(log_probs, labels, input_lengths=None, label_lengths=None
   """Pure TF implementation of the RNN-T loss."""
   shape = tf.shape(log_probs)
   n_batch = shape[0]     # B
-  max_time = shape[1]    # T TODO: "+ 1"?
+  max_time = shape[1]    # T
   max_target = shape[2]  # U
 
   log_probs_tr = tf.transpose(log_probs, [0, 2, 1, 3])  # (B, T, U, V) -> (B, U, T, V)
   log_probs_shifted = tf_shift_logprobs(log_probs_tr, axis=1, axis_to_expand=2)  # (B, U+T+1, U, V)
 
   labels_in = py_print_iteration_info("labels", labels, 0, debug=debug)
-  labels_shifted_mat = tf_shift_matrix_2d(labels_in, n_time=max_time)  # (B, U-1, T+U-1)
+  labels_shifted_mat = tf_shift_matrix_2d(labels_in, n_time=max_time+1)  # (B, U-1, T+U-1)
   labels_shifted_mat = tf.transpose(labels_shifted_mat, (2, 0, 1))
   labels_shifted_mat = py_print_iteration_info("labels_shifted_mat", labels_shifted_mat, 0, debug=debug)
 
@@ -1030,7 +1032,7 @@ def tf_forward_shifted(log_probs, labels, input_lengths=None, label_lengths=None
   log_probs_ta = tf.TensorArray(
     dtype=tf.float32,
     clear_after_read=False,
-    size=max_time + max_target + 1,
+    size=max_time + max_target,
     dynamic_size=False,
     infer_shape=False,
     element_shape=(None, None, None),  # (B, U, V)
@@ -1048,7 +1050,7 @@ def tf_forward_shifted(log_probs, labels, input_lengths=None, label_lengths=None
     element_shape=(None, None,),  # (B, n)
     name="alpha_diagonals",
   )
-  alpha_ta = alpha_ta.write(1, tf.zeros((n_batch, 2)))
+  alpha_ta = alpha_ta.write(1, tf.zeros((n_batch, 1)))
 
   def cond(n, *args):
     """We run the loop until all elements are covered by diagonals.
@@ -1061,11 +1063,11 @@ def tf_forward_shifted(log_probs, labels, input_lengths=None, label_lengths=None
     # alpha(t-1,u) + logprobs(t-1, u)
     # alpha_blank      + lp_blank
 
-    prev_max_diag_len = tf.minimum(max_target-1, n-1)
-    prev_diagonal = alpha_ta.read(n-1)[:, :prev_max_diag_len]  # (B, n-1)
-    prev_diagonal = py_print_iteration_info("prev_diagonal", prev_diagonal, n, debug=debug)
-    lp_diagonal = log_probs_ta.read(n-2)[:, :prev_max_diag_len, :]  # (B, U|n, V)
+    lp_diagonal = log_probs_ta.read(n-2)[:, :n-1, :]  # (B, U|n, V)
     lp_diagonal = py_print_iteration_info("lp_diagonal", lp_diagonal, n, debug=debug)
+
+    prev_diagonal = alpha_ta.read(n-1)[:, :n]  # (B, n-1)
+    prev_diagonal = py_print_iteration_info("prev_diagonal", prev_diagonal, n, debug=debug)
 
     alpha_blank = prev_diagonal  # (B, N)
     alpha_blank = tf.concat([alpha_blank, tf.tile([[tf.constant(NEG_INF)]], [n_batch, 1])], axis=1)
@@ -1096,6 +1098,17 @@ def tf_forward_shifted(log_probs, labels, input_lengths=None, label_lengths=None
     # (B, U) ; (B, 1) -> (B, U+1)
     lp_y = tf.concat([tf.tile([[tf.constant(NEG_INF)]], [n_batch, 1]), lp_y], axis=1)
     lp_y = py_print_iteration_info("lp(y)", lp_y, n, debug=debug)
+
+    cut_off = max_target
+    alpha_y = tf.cond(tf.greater(n, max_target),
+                      lambda: alpha_y[:, :cut_off],
+                      lambda: alpha_y)
+    lp_blank = tf.cond(tf.greater(n, max_target),
+                       lambda: lp_blank[:, :cut_off],
+                       lambda: lp_blank)
+    alpha_blank = tf.cond(tf.greater(n, max_target),
+                          lambda: alpha_blank[:, :cut_off],
+                          lambda: alpha_blank)
 
     # all should have shape (B, n)
     blank = alpha_blank + lp_blank
@@ -1135,6 +1148,7 @@ def tf_forward_shifted(log_probs, labels, input_lengths=None, label_lengths=None
   within_diag_idx = tf.where(tf.greater(label_lengths, input_lengths),
                              label_lengths,
                              within_diag_idx)
+  within_diag_idx = label_lengths
 
   def ta_read_body(i, res_ta):
     """Reads from the alpha-diagonals TensorArray. We need this because of the inconsistent shapes in there."""
@@ -1200,35 +1214,32 @@ def test_impl(name, acts, labels, blank_index, input_lens=None, label_lens=None,
 
   def print_results(name, cost, grads):
     """Prints the results of an implementation."""
-    if isinstance(cost, np.ndarray):
-      if cost.shape[0] == 1:
-        cost = cost[0]
+    cost = sum(cost)
+    if grads is None:
+      grads_msg = "n/a"
+    else:
+      grads_msg = "%.3f" % np.linalg.norm(grads)
     print(colored("%20s" % name, "red"),
-          "implementation: log-posterior=%r, |grads|=%.4f" % (
-            cost, np.linalg.norm(grads)))
+          "implementation: log-posterior=%.3f, |grads|=%s" % (
+            cost,  grads_msg))
   print("Test", colored("%s" % name, "yellow"))
 
   list_ll = []
   list_grads = []
-  # ll_ref, grads_ref = transduce_batch(log_probs, labels)
-  # ll_ref = -np.array(ll_ref)
   for i in range(n_batch):
     cost_ref, grads_ref = transduce_ref(log_probs[i, :input_lens[i] + 1, :label_lens[i] + 1], labels[i, :label_lens[i]],
                                         blank=blank_index)
     list_ll.append(-cost_ref)
     list_grads.append(grads_ref)
   costs_ref = np.stack(list_ll, axis=0)
-  # grads_ref = np.stack(list_grads, axis=0)
   print_results("Reference", costs_ref, grads_ref)
 
   costs_np = numpy_forward_shifted_batched(log_probs, labels, blank_index=blank_index,
                                            input_lens=input_lens, label_lens=label_lens,
                                            debug=debug)
-  print_results("Numpy", costs_np, np.zeros_like(grads_ref))
+  # print_results("Numpy", costs_np, np.zeros_like(grads_ref))
   np.testing.assert_almost_equal(costs_np, costs_ref, decimal=5)
-  print("numpy shifted vs reference: log posterior", colored("MATCH", "green"))
-  return
-
+  print_results("Numpy shifted", costs_np, None)
 
   with sess.as_default():
     input_lengths_t = tf.constant(input_lens, dtype=tf.int32)  # (B,)
@@ -1252,7 +1263,7 @@ def test_impl(name, acts, labels, blank_index, input_lens=None, label_lens=None,
     costs_ph = tf_forward_shifted(log_probs_ph, labels_ph,
                                   input_lengths=input_lengths_ph,
                                   label_lengths=label_lengths_ph,
-                                  blank_index=blank_index, debug=True)
+                                  blank_index=blank_index, debug=debug)
     grads_ph = tf.gradients(xs=log_probs_ph, ys=[-costs_ph])[0]
     costs_tf, grads_tf = sess.run([costs_ph, grads_ph],
                                   feed_dict={log_probs_ph: log_probs,
@@ -1264,13 +1275,14 @@ def test_impl(name, acts, labels, blank_index, input_lens=None, label_lens=None,
   # Do all the tests (ref vs TF), for score, and grads (TF/Ref)
   # We don't have an alpha-matrix anymore (instead there are diagonals)
   np.testing.assert_almost_equal(costs_warprnnt, costs_ref, decimal=5)
-  print("TF vs warp: log posterior", colored("MATCH", "green"))
-  np.testing.assert_almost_equal(grads_warprnnt[-1], grads_ref, decimal=5)
-  print("TF vs warp (batch-idx==-1): gradients", colored("MATCH", "green"))
+  print("Warp vs Reference: log posterior", colored("MATCH", "green"))
+  for i in range(n_batch):
+    np.testing.assert_almost_equal(grads_warprnnt[i], list_grads[i], decimal=5)
+  print("Warp vs Reference: gradients    ", colored("MATCH", "green"))
   np.testing.assert_almost_equal(costs_tf, costs_warprnnt, decimal=5)
-  print("TF vs Warp: log posterior", colored("MATCH", "green"))
+  print("TF vs Warp: log posterior       ", colored("MATCH", "green"))
   np.testing.assert_almost_equal(grads_tf, grads_warprnnt, decimal=4)
-  print("TF vs Warp: gradients", colored("MATCH", "green"))
+  print("TF vs Warp: gradients           ", colored("MATCH", "green"))
   print()
   return costs_tf, grads_tf
 
