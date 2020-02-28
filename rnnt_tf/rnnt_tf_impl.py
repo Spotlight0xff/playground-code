@@ -101,7 +101,6 @@ def numpy_forward(log_probs, labels, blank_index, debug=False):
 def numpy_forward_shifted_batched(log_probs, labels, blank_index, input_lens, label_lens, debug=False):
   """Forward calculation of the RNN-T loss using the same diagonal strategy."""
   n_batch, max_time, max_target, n_vocab = log_probs.shape  # (B, T, U, V)
-  debug = True
   assert labels.shape == (n_batch, max_target-1)  # (B, U-1)
   if debug:
     print("U=%d, T=%d, V=%d" % (max_target, max_time, n_vocab))
@@ -169,10 +168,19 @@ def numpy_forward_shifted_batched(log_probs, labels, blank_index, input_lens, la
     alpha_y = prev_diagonal
     #if n <= min(max_time, max_target):  # still in phase (a)
     alpha_y = np.concatenate([np.tile([[NEG_INF]], [n_batch, 1]), alpha_y], axis=1)
-    if n > (max_time-1) + (max_target-1):  # phase (c), cut off top-right
-      alpha_y = alpha_y[:, :(max_time-1) + (max_target-1)]
-      lp_blank = lp_blank[:, :(max_time-1) + (max_target-1)]
-      alpha_blank = alpha_blank[:, :(max_time - 1) + (max_target - 1)]
+
+    # NOTE:
+    # We compute the diagonals from bottom-left to top-right.
+    # However, we cut off the diagonals in the top-right corner,
+    # as soon as we can make sure there are no interesting values.
+    # this happens in T >= U: when n > U
+    #                 T <  U: when
+
+    cut_off = max_target
+    if n > cut_off:  # phase (c), cut off top-right
+      alpha_y = alpha_y[:, :cut_off]
+      lp_blank = lp_blank[:, :cut_off]
+      alpha_blank = alpha_blank[:, :cut_off]
 
     # labels_maxlen = tf.minimum(max_target - 1, n - 1)
     labels_maxlen = min(max_target - 1, n - 1)
@@ -226,7 +234,9 @@ def numpy_forward_shifted_batched(log_probs, labels, blank_index, input_lens, la
     print_debug(n, "new_diagonal", new_diagonal)
     alphas.append(new_diagonal)  # s.t. alphas[n] == new_diagonal
     # new_diagonal = py_print_iteration_info("new_diagonal", new_diagonal, n, debug=debug)
-    print("\n")
+
+    if debug:
+      print("\n")
 
 
 
@@ -238,7 +248,8 @@ def numpy_forward_shifted_batched(log_probs, labels, blank_index, input_lens, la
 
   # (B,): batch index -> index within diagonal
   # We need to handle the U>T case for each example.
-  within_diag_idx = np.minimum(input_lens, label_lens)
+  #within_diag_idx = np.minimum(input_lens, label_lens)
+  within_diag_idx = label_lens
   #within_diag_idx = np.where(max_target > max_time,
   #                           max_time - input_lens,
   #                           max_target - label_lens)
@@ -1211,7 +1222,8 @@ def test_impl(name, acts, labels, blank_index, input_lens=None, label_lens=None,
   print_results("Reference", costs_ref, grads_ref)
 
   costs_np = numpy_forward_shifted_batched(log_probs, labels, blank_index=blank_index,
-                                           input_lens=input_lens, label_lens=label_lens)
+                                           input_lens=input_lens, label_lens=label_lens,
+                                           debug=debug)
   print_results("Numpy", costs_np, np.zeros_like(grads_ref))
   np.testing.assert_almost_equal(costs_np, costs_ref, decimal=5)
   print("numpy shifted vs reference: log posterior", colored("MATCH", "green"))
@@ -1437,9 +1449,9 @@ if __name__ == '__main__':
   better_exchook.install()
 
   test_small()
-  #test_size_u_greater_t()
-  #test_size_t_greater_u()
-  #test_size_t_equal_u()
-  #test_random()
-  #test_batched()
-  #test_sizes()
+  test_size_u_greater_t()
+  test_size_t_greater_u()
+  test_size_t_equal_u()
+  test_random()
+  test_batched()
+  test_sizes()
