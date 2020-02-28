@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="VcsDirectoryMappings">
+    <mapping directory="$PROJECT_DIR$/.." vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/returnn" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/returnn/extern/HawkAaronWarpTransducer/warp-transducer" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/returnn/extern/HawkAaronWarpTransducer/warp-transducer/mxnet_binding" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/returnn/extern/ParseOggVorbis" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/returnn/extern/blocksparse" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/returnn/extern/kenlm" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/returnn/extern/openfst" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/returnn/extern_private/transducer" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/returnn/extern_private/warp-rna" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/returnn/extern_private/warp-transducer" vcs="Git" />
+  </component>
+</project>
