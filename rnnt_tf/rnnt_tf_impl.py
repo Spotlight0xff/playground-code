@@ -123,8 +123,6 @@ def numpy_forward_shifted_batched(log_probs, labels, blank_index, input_lens, la
     print("log-probs")
     for n in range(2, max_time+max_target):
       print("lp(blank) for n=%d" % n, shifted_logprobs[0, n - 2, ..., 0])
-      #print("lp(1) for n=%d" % n, shifted_logprobs[0, n-2, ..., 1])
-      #print("lp(2) for n=%d" % n, shifted_logprobs[0, n-2, ..., 2])
 
   def print_debug(n, *vars):
     """Some basic debug information printing."""
@@ -134,69 +132,36 @@ def numpy_forward_shifted_batched(log_probs, labels, blank_index, input_lens, la
   alphas = [[], np.zeros((n_batch, 1))]
 
   for n in range(2, max_time+max_target):
-    #prev_max_diag_len = min(max_target-1, n-1)
-
-    # lp_diagonal = log_probs_ta.read(n - 2)[:, :prev_max_diag_len, :]  # (B, U|n, V)
     # actually previous one.
     lp_diagonal = shifted_logprobs[:, n-2, :n-1]  # (B, n-1, V)
     print_debug(n, "lp_diagonal", lp_diagonal)
 
-    # labels_n = shifted_labels[n, :]  # (U-1,)
-    # print_debug(n, "labels", labels_n)
-
     prev_diagonal = alphas[n-1][:, :n]
     print_debug(n, "prev_diagonal", prev_diagonal)
 
-    # another fix!!
-    #if n > max_time:
-    #  alpha_blank = prev_diagonal[:, 1:]
-    #else:
     alpha_blank = prev_diagonal  # (B, N)
     alpha_blank = np.concatenate([alpha_blank, np.tile([[NEG_INF]], [n_batch, 1])], axis=1)
-    # alpha_blank = tf.concat([alpha_blank, tf.tile([[tf.constant(NEG_INF)]], [n_batch, 1])], axis=1)
 
     # (B, U, V) -> (B, U)
-    # this is one fix!! `n-2:` instead of `:` to correctly use the shifted log-probs
     lp_blank = lp_diagonal[:, :, blank_index]  # (B, U)
     lp_blank = np.concatenate([lp_blank, np.tile([[NEG_INF]], [n_batch, 1])], axis=1)
-    # lp_blank = tf.concat([lp_blank, tf.tile([[tf.constant(NEG_INF)]], [n_batch, 1])], axis=1)
-    # (B,N-1) ; (B,1) ->  (B, N)
-    #if n == 2:
-    #  alpha_y = prev_diagonal
-    #else:
-    #  alpha_y = prev_diagonal[:, 1:]
+
     alpha_y = prev_diagonal
-    #if n <= min(max_time, max_target):  # still in phase (a)
     alpha_y = np.concatenate([np.tile([[NEG_INF]], [n_batch, 1]), alpha_y], axis=1)
 
     # NOTE:
     # We compute the diagonals from bottom-left to top-right.
     # However, we cut off the diagonals in the top-right corner,
     # as soon as we can make sure there are no interesting values.
-    # this happens in T >= U: when n > U
-    #                 T <  U: when
-
+    # this happens when n > U.
     cut_off = max_target
     if n > cut_off:  # phase (c), cut off top-right
       alpha_y = alpha_y[:, :cut_off]
       lp_blank = lp_blank[:, :cut_off]
       alpha_blank = alpha_blank[:, :cut_off]
 
-    # labels_maxlen = tf.minimum(max_target - 1, n - 1)
     labels_maxlen = min(max_target - 1, n - 1)
-    # labels_shifted = labels_shifted_ta.read(n - 1)
-    # labels_shifted = shifted_labels[n-1, :, :labels_maxlen]  # (max_time+max_target-1, n_batch, max_target-1)
-
-    # labels_shifted = labels_shifted[:, :labels_maxlen]  # (B,U)
-    #start_slice = 0
-    #if n > min(max_target, max_time):
-    #  start_slice = n - min(max_target, max_time) - 1
-    #labels_shifted = labels[:, start_slice:end_slice]
-    #labels_shifted = shifted_labels[n - 1, :, start_slice:labels_maxlen]  # (max_time+max_target-1, n_batch, max_target-1)
-    labels_shifted = shifted_labels[n - 1, :, :min(n-1, max_target-1)]  # (max_time+max_target-1, n_batch, max_target-1)
-    # pad top-right end of diagonal
-    #if n >= min(max_target, max_time) + max_target - 1:  # in phase (c), U critical
-    #  labels_shifted = np.pad(labels_shifted, [[0, 0],
+    labels_shifted = shifted_labels[n - 1, :, :labels_maxlen]  # (max_time+max_target-1, n_batch, max_target-1)
                                               # [0, n - max_target]])
     print_debug(n, "labels_shifted", labels_shifted)
     B, R = np.meshgrid(
@@ -204,16 +169,8 @@ def numpy_forward_shifted_batched(log_probs, labels, blank_index, input_lens, la
       np.arange(np.shape(labels_shifted)[1]),  # U-1, TODO: maybe +1?
       indexing='ij'
     )
-    print_debug(n, "B:", B, "R", R)
-    # lp_y_idxs = np.stack([B, R, labels_shifted], axis=-1)  # (B, V, 3)
-    # lp_y_idxs = py_print_iteration_info("lp_y_idxs", lp_y_idxs, n, debug=debug)
-
-    #lp_y = lp_diagonal[:, start_slice:]
     lp_y = lp_diagonal[B, R, labels_shifted]
-    # lp_y = tf.gather_nd(lp_diagonal[:, :, :], lp_y_idxs)  # (B, U)
-    # (B, U) ; (B, 1) -> (B, U+1)
     lp_y = np.concatenate([np.tile([[NEG_INF]], [n_batch, 1]), lp_y], axis=1)
-
 
     # all should have shape (B, n)
     print_debug(n, colored("lp_blank", "green"), lp_blank)
@@ -226,36 +183,22 @@ def numpy_forward_shifted_batched(log_probs, labels, blank_index, input_lens, la
     print_debug(n, colored("alpha_y", "red"), alpha_y)
     y = alpha_y + lp_y
     print_debug(n, colored("y", "red"), y)
-    # red_op = np.stack([blank, y], axis=0)  # (2, B, N)
-    # print_debug(n, "red-op", red_op)
     new_diagonal = np.logaddexp(blank, y)  # (B, N)
 
     new_diagonal = new_diagonal[:, :n]
     print_debug(n, "new_diagonal", new_diagonal)
     alphas.append(new_diagonal)  # s.t. alphas[n] == new_diagonal
-    # new_diagonal = py_print_iteration_info("new_diagonal", new_diagonal, n, debug=debug)
 
     if debug:
       print("\n")
 
-
-
-    #alpha[t, 0] = alpha[t - 1, 0] + log_probs[t - 1, 0, blank_index]
-    #print('t=%2d u= 0: alpha[%d, 0] + log_probs[%d, 0, %d] = %.3f + %.3f = %.3f' % (
-    #  t, t-1, t-1, blank_index, alpha[t - 1, 0], log_probs[t - 1, 0, blank_index], alpha[t, 0]))
   list_nll = []
   diag_idxs = input_lens + label_lens  # (B,)
 
   # (B,): batch index -> index within diagonal
   # We need to handle the U>T case for each example.
-  #within_diag_idx = np.minimum(input_lens, label_lens)
   within_diag_idx = label_lens
-  #within_diag_idx = np.where(max_target > max_time,
-  #                           max_time - input_lens,
-  #                           max_target - label_lens)
-
   for i in range(n_batch):
-
     ta_item = alphas[diag_idxs[i]]  # (B, N)
 
     a = ta_item[i, within_diag_idx[i]]
