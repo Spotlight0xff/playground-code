@@ -43,11 +43,11 @@ def log_softmax(acts, axis=None):
   return log_probs
 
 
-def py_print_iteration_info(msg, var, n, debug=True):
+def py_print_iteration_info(msg, var, n, *vars, debug=True):
   """adds a tf.print op to the graph while ensuring it will run (when the output is used)."""
   if not debug:
     return var
-  var_print = tf.print("n=", n, "\t", msg, tf.shape(var), var,
+  var_print = tf.print("n=", n, "\t", msg, tf.shape(var), var, *vars,
                        summarize=-1, output_stream=sys.stdout)
   with tf.control_dependencies([var_print]):
     var = tf.identity(var)
@@ -365,10 +365,13 @@ def tf_forward_shifted_rna(log_probs, labels, input_lengths=None, label_lengths=
   # ll_tf = final_alpha[n_time-1, n_target-1]
 
   # (B,): batch index -> diagonal index
-  diag_idxs = input_lengths + 1  # (B,)
+  diag_idxs = input_lengths - 1  # (B,)
 
   # (B,): batch index -> index within diagonal
-  within_diag_idx = label_lengths
+  within_diag_idx = label_lengths - 1
+  within_diag_idx = tf.where(tf.less(label_lengths+1, input_lengths), 
+      within_diag_idx,  # everything ok, T>U
+      tf.ones_like(within_diag_idx) * -1)  #  U > T, not possible in RNA
 
   res_ta = tf.TensorArray(
     dtype=tf.float32,
@@ -379,11 +382,14 @@ def tf_forward_shifted_rna(log_probs, labels, input_lengths=None, label_lengths=
     element_shape=(),
     name="alpha_diagonals",
   )
+  tf_neg_inf = tf.constant(NEG_INF)
 
   def ta_read_body(i, res_loop_ta):
     """Reads from the alpha-diagonals TensorArray. We need this because of the inconsistent shapes in the TA."""
     ta_item = alpha_out_ta.read(diag_idxs[i])[i]
-    return i+1, res_loop_ta.write(i, ta_item[within_diag_idx[i]])
+    ta_item = py_print_iteration_info("FINAL", ta_item, i, diag_idxs, within_diag_idx, debug=debug)
+    elem = tf.cond(tf.equal(within_diag_idx[i], -1), lambda: tf_neg_inf, lambda: ta_item[within_diag_idx[i]])
+    return i+1, res_loop_ta.write(i, elem)
 
   _, ll_ta = tf.while_loop(
     lambda i, res_ta: i < n_batch,
