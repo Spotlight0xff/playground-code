@@ -365,11 +365,11 @@ def tf_forward_shifted_rna(log_probs, labels, input_lengths=None, label_lengths=
   # ll_tf = final_alpha[n_time-1, n_target-1]
 
   # (B,): batch index -> diagonal index
-  diag_idxs = input_lengths - 1  # (B,)
+  diag_idxs = input_lengths +1   # (B,)
 
   # (B,): batch index -> index within diagonal
-  within_diag_idx = label_lengths - 1
-  within_diag_idx = tf.where(tf.less(label_lengths+1, input_lengths), 
+  within_diag_idx = label_lengths
+  within_diag_idx = tf.where(tf.less_equal(label_lengths, input_lengths),
       within_diag_idx,  # everything ok, T>U
       tf.ones_like(within_diag_idx) * -1)  #  U > T, not possible in RNA
 
@@ -387,8 +387,8 @@ def tf_forward_shifted_rna(log_probs, labels, input_lengths=None, label_lengths=
   def ta_read_body(i, res_loop_ta):
     """Reads from the alpha-diagonals TensorArray. We need this because of the inconsistent shapes in the TA."""
     ta_item = alpha_out_ta.read(diag_idxs[i])[i]
-    ta_item = py_print_iteration_info("FINAL", ta_item, i, diag_idxs, within_diag_idx, debug=debug)
     elem = tf.cond(tf.equal(within_diag_idx[i], -1), lambda: tf_neg_inf, lambda: ta_item[within_diag_idx[i]])
+    elem = py_print_iteration_info("FINAL", elem, i, "diag_idxs", diag_idxs, "within_diag_idx:",within_diag_idx, debug=debug)
     return i+1, res_loop_ta.write(i, elem)
 
   _, ll_ta = tf.while_loop(
@@ -548,7 +548,7 @@ def test_sizes():
   n_vocab = 5
 
   for n_time in range(3, 12):
-    for n_target in range(3, 12):
+    for n_target in range(3, n_time+2):
       acts = np.random.random_sample((n_time, n_target, n_vocab))
       labels = np.random.randint(1, n_vocab-1, (n_target-1,))
       test_impl("test_sizes: T=%d, U=%d" % (n_time, n_target), acts, labels, blank_index)
@@ -636,6 +636,7 @@ if __name__ == '__main__':
   test_small()
   test_size_t_greater_u()
   test_size_t_equal_u()
+  test_sizes()
   test_blank_idx_nonzero()
   test_batched()
   test_big()
