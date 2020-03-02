@@ -13,6 +13,7 @@ Based on the papers:
 """
 
 import numpy as np
+from termcolor import colored
 
 NEG_INF = -float("inf")
 
@@ -141,6 +142,7 @@ def test():
 
     assert np.allclose(ll_forward, ll_backward, atol=1e-12, rtol=1e-12), \
         "Log-likelihood from forward and backward pass mismatch."
+    print("LL forward == LL backward:    %s" % colored("MATCH", "green"))
 
     neg_loglike = -ll_forward
 
@@ -149,6 +151,7 @@ def test():
 
     assert np.allclose(analytical_grads, numerical_grads, atol=1e-6, rtol=1e-6), \
         "Analytical and numerical computation of gradient mismatch."
+    print("analytical == numerical grad: %s" % colored("MATCH", "green"))
 
 
 if __name__ == "__main__":
