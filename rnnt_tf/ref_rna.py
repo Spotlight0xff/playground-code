@@ -132,12 +132,19 @@ def test():
     vocab_size = 4
     input_len = 5
     output_len = 3
+    print("T=%d, U=%d, V=%d" % (input_len, output_len+1, vocab_size))
     inputs = np.random.rand(input_len, output_len + 1, vocab_size)
     labels = np.random.randint(1, vocab_size, output_len)
 
     log_probs = log_softmax(inputs, axis=2)
+    print("log-probs:", log_probs.shape)
+    print(log_probs[...,0])
 
     alphas, ll_forward = forward_pass(log_probs, labels, blank)
+    print("alphas")
+    print(alphas)
+    print("LL forward")
+    print(ll_forward)
     betas, ll_backward = backward_pass(log_probs, labels, blank)
 
     assert np.allclose(ll_forward, ll_backward, atol=1e-12, rtol=1e-12), \
