@@ -1224,7 +1224,7 @@ def test_sizes():
       test_impl("test_sizes: T=%d, U=%d" % (n_time, n_target), acts, labels, blank_index)
 
 
-def test_blank_idx_greater():
+def test_blank_idx_nonzero():
   """Tests when the blank-idx is not 0."""
   n_time = 2
   n_target = 3
@@ -1336,10 +1336,10 @@ if __name__ == '__main__':
   import better_exchook
   better_exchook.install()
 
-  #test_small()
-  #test_size_u_greater_t()
-  #test_size_t_greater_u()
-  #test_size_t_equal_u()
-  test_blank_idx_greater()
-  #test_batched()
-  #test_sizes()
+  test_small()
+  test_size_u_greater_t()
+  test_size_t_greater_u()
+  test_size_t_equal_u()
+  #test_blank_idx_nonzero()  # TODO: wrong!!
+  test_batched()
+  test_sizes()
