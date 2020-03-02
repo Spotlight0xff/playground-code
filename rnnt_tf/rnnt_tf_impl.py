@@ -7,16 +7,12 @@ plus comparisons against reference implementations.
 import os
 import sys
 import numpy as np
-import better_exchook
 import tensorflow as tf
 from termcolor import colored
-from ref_transduce import forward_pass, transduce_batch
 from ref_transduce import transduce as transduce_ref
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "returnn"))
 from extern.HawkAaronWarpTransducer import rnnt_loss
 
-tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.ERROR)
-# better_exchook.install()
 NEG_INF = -float("inf")
 
 
@@ -106,20 +102,15 @@ def numpy_forward_shifted_batched(log_probs, labels, blank_index, input_lens, la
     print("U=%d, T=%d, V=%d" % (max_target, max_time, n_vocab))
     print("log-probs: (B=%d, T=%d, U=%d, V=%d)" % (n_batch, max_time, max_target, n_vocab))
     print("labels: (B=%d, U-1=%d)" % (n_batch, labels.shape[1]))
+  num_diagonals = max_time + max_target
 
   with tf.Session().as_default():
-    shifted_labels_tf = tf_shift_matrix_2d(tf.convert_to_tensor(labels), n_time=max_time+1)  # (B, U-1, T+U-1)
-    shifted_labels_tf = tf.transpose(shifted_labels_tf, (2, 0, 1))  # (T+U+1, B, U-1)
-    tf_shifted = tf_shift_logprobs(tf.cast(tf.transpose(log_probs, [0, 2, 1, 3]), dtype=tf.float32), axis=1, axis_to_expand=2)
-    shifted_logprobs, shifted_labels = sess.run([tf_shifted, shifted_labels_tf])
+    tf_shifted = tf_shift_logprobs(tf.cast(tf.transpose(log_probs, [0, 2, 1, 3]), dtype=tf.float32),
+                                   axis=1, axis_to_expand=2)
+    shifted_logprobs = sess.run(tf_shifted)
     shifted_logprobs = np.transpose(shifted_logprobs, (0, 2, 1, 3))  # (B, U, U+T+1, V) -> (B, U+T+1, U, V)
-  assert shifted_logprobs.shape == (n_batch, max_time+max_target, max_target, n_vocab)
-  # assert shifted_labels.shape == (max_time+max_target, n_batch, max_target-1)
-  # assert n_batch == 1
+  assert shifted_logprobs.shape == (n_batch, num_diagonals, max_target, n_vocab)
   if debug:
-    print("labels", shifted_labels.shape)
-    print(shifted_labels)
-    print("\n")
     print("log-probs")
     for n in range(2, max_time+max_target):
       print("lp(blank) for n=%d" % n, shifted_logprobs[0, n - 2, ..., 0])
@@ -161,15 +152,14 @@ def numpy_forward_shifted_batched(log_probs, labels, blank_index, input_lens, la
       alpha_blank = alpha_blank[:, :cut_off]
 
     labels_maxlen = min(max_target - 1, n - 1)
-    labels_shifted = shifted_labels[n - 1, :, :labels_maxlen]  # (max_time+max_target-1, n_batch, max_target-1)
-                                              # [0, n - max_target]])
+    labels_shifted = labels[:, :labels_maxlen]
     print_debug(n, "labels_shifted", labels_shifted)
-    B, R = np.meshgrid(
+    batchs_idxs, rows_idxs = np.meshgrid(
       np.arange(np.shape(labels_shifted)[0]),  # B
-      np.arange(np.shape(labels_shifted)[1]),  # U-1, TODO: maybe +1?
+      np.arange(np.shape(labels_shifted)[1]),  # U-1
       indexing='ij'
     )
-    lp_y = lp_diagonal[B, R, labels_shifted]
+    lp_y = lp_diagonal[batchs_idxs, rows_idxs, labels_shifted]
     lp_y = np.concatenate([np.tile([[NEG_INF]], [n_batch, 1]), lp_y], axis=1)
 
     # all should have shape (B, n)
@@ -879,56 +869,31 @@ def tf_shift_logprobs(mat, axis, axis_to_expand):
   # axis_to_expand: usually U
   # axis: usually T
   # batch-axis has to be first
-  dim_axis = tf.shape(mat)[axis]  # T
+  max_time = tf.shape(mat)[axis]  # T
   n_batch = tf.shape(mat)[0]
+  max_target = tf.shape(mat)[axis_to_expand]
   n_vocab = tf.shape(mat)[-1]
-  shifts = tf.expand_dims(tf.cast(tf.range(dim_axis), tf.float32), axis=1)  # (T,1)
+  shifts = tf.expand_dims(tf.cast(tf.range(max_time), tf.float32), axis=1)  # (T,1)
   shifts = shifts[tf.newaxis, :, :, tf.newaxis]
   shifts = tf.tile(shifts, [n_batch, 1, 1, n_vocab])
-  pads = tf.zeros((n_batch, dim_axis, dim_axis, n_vocab), dtype=tf.float32)
+  pads = tf.zeros((n_batch, max_time, max_time, n_vocab), dtype=tf.float32)
   # (B, T, 1, V) ; (B, T, U, V) ; (B, T, T, V)
   # -> (B, T, U+T+1, V)
   a_ranged = tf.concat([shifts, mat, pads], axis=axis_to_expand)  # (T, U+1)
-  U = tf.shape(mat)[axis_to_expand]
-  T = dim_axis
 
   def fn(x):  # x: (B, U+T+1, V)
+    """Computes the shift per diagonal and pads accordingly."""
     shift = tf.cast(x[0][0][0], tf.int32)  # (B,)
     # 1:U+1 is the original data, in front: shift as wanted, back: padding for shape
-    n = tf.pad(x[:, 1:U + 1, :], [[0, 0],  # B
-                                  [shift, T + 1 - shift],  # U+T+1
-                                  [0, 0]  # V
-                                  ], constant_values=0)
+    n = tf.pad(x[:, 1:max_target + 1, :], [[0, 0],  # B
+                                           [shift, max_time + 1 - shift],  # U+T+1
+                                           [0, 0]  # V
+                                           ], constant_values=0)
     return n
 
   t = tf.map_fn(fn, elems=tf.transpose(a_ranged, [1, 0, 2, 3]))
   t = tf.transpose(t, [1, 0, 2, 3])
-  # TODO: maybe cut off the last dim (t[:,:,:-1,:], only padding?)s
   return t[:, :, :-1, :]
-
-
-def tf_shift_matrix_2d(mat, n_time):
-  mat = tf.convert_to_tensor(mat)
-  shape = tf.shape(mat)
-  mat = tf.expand_dims(mat, axis=-1)  # (B, U, 1)
-  mat = tf.tile(mat, [1, 1, n_time])  # (B, U, T)
-  # batch, rows
-  idxs_b, idxs_rows, idxs_cols = tf.meshgrid(
-      tf.range(shape[0]),  # (B,)
-      tf.range(shape[1]),  # (U,)
-      tf.range(n_time),    # (T,)
-      indexing='ij')
-  shifts = tf.range(shape[1])  # (T,)
-  # (B, U, T) + (1, U, 1)
-  idxs_cols = idxs_cols + shifts[tf.newaxis, :, tf.newaxis]
-  idxs = tf.stack([idxs_b, idxs_rows, idxs_cols], axis=-1)
-
-  # (B, U, T+U)
-  new_shape = [shape[0], shape[1], shape[1] + n_time]
-  # idxs: (B, U, U+T, 3)
-  scat_mat = tf.scatter_nd(indices=idxs, updates=mat,
-                           shape=new_shape)
-  return scat_mat
 
 
 def tf_forward_shifted(log_probs, labels, input_lengths=None, label_lengths=None, blank_index=0, debug=False):
@@ -953,29 +918,14 @@ def tf_forward_shifted(log_probs, labels, input_lengths=None, label_lengths=None
   log_probs_tr = tf.transpose(log_probs, [0, 2, 1, 3])  # (B, T, U, V) -> (B, U, T, V)
   log_probs_shifted = tf_shift_logprobs(log_probs_tr, axis=1, axis_to_expand=2)  # (B, U+T+1, U, V)
 
-  labels_in = py_print_iteration_info("labels", labels, 0, debug=debug)
-  labels_shifted_mat = tf_shift_matrix_2d(labels_in, n_time=max_time+1)  # (B, U-1, T+U-1)
-  labels_shifted_mat = tf.transpose(labels_shifted_mat, (2, 0, 1))
-  labels_shifted_mat = py_print_iteration_info("labels_shifted_mat", labels_shifted_mat, 0, debug=debug)
-
-  # 2 = 1 for starting at n=1, 1 for label lengths+1==U
   num_diagonals = max_time + max_target
 
-  labels_shifted_ta = tf.TensorArray(
-    dtype=tf.int32,
-    clear_after_read=False,
-    size=max_time + max_target,
-    dynamic_size=True,
-    infer_shape=False,
-    element_shape=(None, None),  # (B, U-1)
-    name="labels_shifted",
-  )
-  labels_shifted_ta = labels_shifted_ta.unstack(labels_shifted_mat)
+  labels = py_print_iteration_info("labels", labels, 0, debug=debug)
 
   log_probs_ta = tf.TensorArray(
     dtype=tf.float32,
     clear_after_read=False,
-    size=max_time + max_target,
+    size=num_diagonals,
     dynamic_size=False,
     infer_shape=False,
     element_shape=(None, None, None),  # (B, U, V)
@@ -986,7 +936,7 @@ def tf_forward_shifted(log_probs, labels, input_lengths=None, label_lengths=None
 
   alpha_ta = tf.TensorArray(
     dtype=tf.float32,
-    clear_after_read=False,  # TODO, check, correct?
+    clear_after_read=False,
     size=num_diagonals,
     dynamic_size=False,
     infer_shape=False,
@@ -997,7 +947,6 @@ def tf_forward_shifted(log_probs, labels, input_lengths=None, label_lengths=None
 
   def cond(n, *args):
     """We run the loop until all elements are covered by diagonals.
-    Minus two, because we start at n=1 and we have precomputed values already.
     """
     return tf.less(n, num_diagonals)
 
@@ -1027,15 +976,14 @@ def tf_forward_shifted(log_probs, labels, input_lengths=None, label_lengths=None
     alpha_y = py_print_iteration_info("alpha(y)", alpha_y, n, debug=debug)
 
     labels_maxlen = tf.minimum(max_target-1, n-1)
-    labels_shifted = labels_shifted_ta.read(n-1)
-    labels_shifted = labels_shifted[:, :labels_maxlen]  # (B,U)
+    labels_shifted = labels[:, :labels_maxlen]  # (B, U-1|n-1)
     labels_shifted = py_print_iteration_info("labels_shifted", labels_shifted, n, debug=debug)
-    B, R = tf.meshgrid(
-      tf.range(tf.shape(labels_shifted)[0]),
-      tf.range(tf.shape(labels_shifted)[1]),
+    batchs, rows = tf.meshgrid(
+      tf.range(n_batch),
+      tf.range(labels_maxlen),
       indexing='ij'
     )
-    lp_y_idxs = tf.stack([B, R, labels_shifted], axis=-1)  # (B, V, 3)
+    lp_y_idxs = tf.stack([batchs, rows, labels_shifted], axis=-1)  # (B, U-1|n-1, 3)
     lp_y_idxs = py_print_iteration_info("lp_y_idxs", lp_y_idxs, n, debug=debug)
     lp_y = tf.gather_nd(lp_diagonal[:, :, :], lp_y_idxs)  # (B, U)
     # (B, U) ; (B, 1) -> (B, U+1)
@@ -1069,46 +1017,29 @@ def tf_forward_shifted(log_probs, labels, input_lengths=None, label_lengths=None
                                         parallel_iterations=1,  # need this due to the iterative computation using TAs
                                         name="rnnt")
 
-  # stitch together the alpha matrix and compute the gradients manually.
-
   # p(y|x) = alpha(T,U) * blank(T,U)  (--> in log-space)
   # ll_tf = final_alpha[n_time-1, n_target-1] + log_probs[n_time-1, n_target-1, blank_index]
 
   # (B,): batch index -> diagonal index
   diag_idxs = input_lengths + label_lengths  # (B,)
+
+  # (B,): batch index -> index within diagonal
+  within_diag_idx = label_lengths
+
   res_ta = tf.TensorArray(
     dtype=tf.float32,
-    clear_after_read=False,  # TODO, check, correct?
+    clear_after_read=True,
     size=n_batch,
     dynamic_size=False,
     infer_shape=False,
     element_shape=(),
     name="alpha_diagonals",
   )
-  # (B,): batch index -> index within diagonal
-  # We need to handle the U>T case for each example.
-  within_diag_idx = tf.minimum(input_lengths, label_lengths)
-  within_diag_idx = tf.where(tf.greater(label_lengths, input_lengths),
-                             label_lengths,
-                             within_diag_idx)
-  within_diag_idx = label_lengths
 
-  def ta_read_body(i, res_ta):
-    """Reads from the alpha-diagonals TensorArray. We need this because of the inconsistent shapes in there."""
+  def ta_read_body(i, res_loop_ta):
+    """Reads from the alpha-diagonals TensorArray. We need this because of the inconsistent shapes in the TA."""
     ta_item = alpha_out_ta.read(diag_idxs[i])[i]
-
-    if debug:
-      var_print = tf.print("FINAL", "\t", "i=", i, "T=", max_time, "U=", max_target,
-                           "T'=", input_lengths[i],
-                           "U'=", label_lengths[i],
-                           "diag_idx=", diag_idxs[i],
-                           "within_diag_idx=", within_diag_idx[i],
-                           "size(alpha)", tf.shape(ta_item), ta_item,
-                           summarize=-1, output_stream=sys.stdout)
-
-      with tf.control_dependencies([var_print]):
-        ta_item = tf.identity(ta_item)
-    return i+1, res_ta.write(i, ta_item[within_diag_idx[i]])
+    return i+1, res_loop_ta.write(i, ta_item[within_diag_idx[i]])
 
   i, a_ta = tf.while_loop(
     lambda i, res_ta: i < n_batch,
@@ -1116,15 +1047,15 @@ def tf_forward_shifted(log_probs, labels, input_lengths=None, label_lengths=None
   )
   indices = tf.stack([
     tf.range(n_batch),
-    input_lengths-1,
-    label_lengths,
+    input_lengths-1,  # T-1
+    label_lengths,    # U-1
     tf.tile([blank_index], [n_batch]),
-  ], axis=-1)  # (N, 3)
+  ], axis=-1)  # (B, 3)
   ll_tf = a_ta.stack() + tf.gather_nd(log_probs, indices)
   return ll_tf
 
 
-def test_impl(name, acts, labels, blank_index, input_lens=None, label_lens=None, with_warprnnt=True,
+def test_impl(name, acts, labels, blank_index, input_lens=None, label_lens=None,
               timing=False, debug=False):
   """
   runs the different implementations on the same data, comparing them.
@@ -1135,7 +1066,6 @@ def test_impl(name, acts, labels, blank_index, input_lens=None, label_lens=None,
   :param int blank_index:
   :param label_lens: (B,)|None
   :param input_lens: (B,)|None
-  :param bool with_warprnnt: whether to check also WarpRNN-T implementation
   :param timing:
   :param debug:
   :return: costs, grads
@@ -1169,6 +1099,7 @@ def test_impl(name, acts, labels, blank_index, input_lens=None, label_lens=None,
 
   list_ll = []
   list_grads = []
+  grads_ref = None
   for i in range(n_batch):
     cost_ref, grads_ref = transduce_ref(log_probs[i, :input_lens[i] + 1, :label_lens[i] + 1], labels[i, :label_lens[i]],
                                         blank=blank_index)
@@ -1293,15 +1224,16 @@ def test_sizes():
       test_impl("test_sizes: T=%d, U=%d" % (n_time, n_target), acts, labels, blank_index)
 
 
-def test_random():
-  """Tests when there are some zeros: 0 -> -inf in log-space."""
-  blank_index = 3
+def test_blank_idx_greater():
+  """Tests when the blank-idx is not 0."""
   n_time = 2
   n_target = 3
   n_vocab = 5
   acts = np.random.standard_normal((n_time, n_target, n_vocab))
   labels = np.array([1, 2])
-  test_impl("test_random", acts, labels, blank_index)
+  blank_index = 2
+  #for blank_index in range(n_vocab):
+  test_impl("test_blank_idx (%d)" % blank_index, acts, labels, blank_index=blank_index)
 
 
 def test_batched():
@@ -1391,7 +1323,7 @@ def test_batched():
   label_lengths = np.array([2] * n_batch)
 
   costs_tf, grads_tf = test_impl("batched", acts, labels, blank_index=0, input_lens=input_lengths,
-                                 label_lens=label_lengths, with_warprnnt=False, timing=False)
+                                 label_lens=label_lengths, timing=False)
   np.testing.assert_almost_equal(costs_tf, -expected_costs, decimal=5)
   print("TF vs Warp: log posterior", colored("MATCH", "green"))
   np.testing.assert_almost_equal(grads_tf, expected_grads, decimal=4)
@@ -1399,14 +1331,15 @@ def test_batched():
 
 
 if __name__ == '__main__':
+  tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.ERROR)
   sess = tf.Session()
   import better_exchook
   better_exchook.install()
 
-  test_small()
-  test_size_u_greater_t()
-  test_size_t_greater_u()
-  test_size_t_equal_u()
-  test_random()
-  test_batched()
-  test_sizes()
+  #test_small()
+  #test_size_u_greater_t()
+  #test_size_t_greater_u()
+  #test_size_t_equal_u()
+  test_blank_idx_greater()
+  #test_batched()
+  #test_sizes()
