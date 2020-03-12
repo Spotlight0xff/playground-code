@@ -54,16 +54,36 @@ def py_print_iteration_info(msg, var, n, *vars, debug=True):
   return var
 
 
-def numpy_forward(log_probs, labels, blank_index, debug=False):
+def numpy_forward(log_probs, labels, blank_index, label_loop=False, debug=False):
   """Forward calculation of the RNA loss."""
   n_time, n_target, n_vocab = log_probs.shape  # (T, U, V)
-  alpha = np.zeros((n_time+1, n_target))  # 1 in log-space
+
+  max_targets = n_target
+  if label_loop:
+    max_targets = 2*(n_target-1)+1
+    # TODO: do we need to merge the repeated labels?
+    # insert before and in-between each label
+    # repeat each label twice... TODO: cleaner?
+    labels_tiled = np.tile(labels[:, np.newaxis], [1, 2]).reshape((-1,))  # (U,) -> (2*U)
+    print("labels before:", labels)
+    labels = np.where(np.arange(max_targets-1) % 2 == 0, labels_tiled, np.ones_like(labels_tiled)*blank_index)
+    labels = np.concatenate([[blank_index], labels])
+    assert len(labels) == max_targets
+    print("labels after:", labels)
+
+  alpha = np.zeros((n_time+1, max_targets))  # 1 in log-space
   print("a = alpha[t-1, u - 1] + log_probs[t - 1, u - 1, labels[u - 1]]")
   print("b = alpha[t-1, u] + log_probs[t-1, u,  blank]")
   print("alpha[t,u] = LSE(a,b)")
   debug = True
   if debug:
     print("U=%d, T=%d, V=%d" % (n_target, n_time, n_vocab))
+
+  if label_loop:
+    # TODO, how to initialize
+    alpha[0, 0] = 0  #log_probs[0, ]
+    alpha[0, 1] = log_probs[0, 0, labels[0]]
+
   for t in range(1, n_time):
     # blank - blank - blank - ...
     alpha[t, 0] = alpha[t - 1, 0] + log_probs[t - 1, 0, blank_index]
@@ -72,39 +92,59 @@ def numpy_forward(log_probs, labels, blank_index, debug=False):
 
     # label - label - label - ...
     u = t
-    if u < n_target:
+    if u < max_targets:
       alpha[t, u] = alpha[t-1, u-1] + log_probs[t-1, u-1, labels[u-1]]
 
-#  for u in range(1, n_target):  # first column
-#    alpha[0, u] = alpha[0, u - 1] + log_probs[0, u - 1, labels[u - 1]]
-#    print('t= 0 u=%2d: alpha[0, %d] + log_probs[0, %d, labels[%d]=%d] = %.3f + %.3f = %.3f' % (
-#      u, u-1, u-1, u-1, labels[u - 1], alpha[0, u - 1], log_probs[0, u - 1, labels[u - 1]], alpha[0, u]))
-
   for t in range(1, n_time+1):
-    for u in range(1, min(t, n_target)):
-      skip = alpha[t - 1, u] + log_probs[t - 1, u, blank_index]
-      emit = alpha[t - 1, u - 1] + log_probs[t - 1, u - 1, labels[u - 1]]
-      alpha[t, u] = elem = logsumexp(skip, emit)  # addition in linear-space -> LSE in log-space
-      print('t=%2d u=%2d: LSE(%.3f + %.3f, %.3f +  %.3f) = LSE(%.3f, %.3f) = %.3f' % (t, u,
-                                                                                      alpha[t - 1, u],
-                                                                                      log_probs[t - 1, u, blank_index],
-                                                                                      alpha[t - 1, u - 1],
-                                                                                      log_probs[t - 1, u - 1,
-                                                                                                labels[u - 1]],
-                                                                                      skip, emit, elem))
+    for s in range(1, min(t, n_target)):
+      if label_loop:
+        u = int(s/2)  # round down
+        # for the CTC model (basically RNA with label repetitions):
+        # unfolded graph for CTC, see e.g. ASG paper, Figure 2 https://openreview.net/pdf?id=BkUDvt5gg
+        # edge cases: t=0 (blank)
+        if s % 2 == 0:  # blank
+          # blank, two incoming edges: (1) same, again blank, (2) previous label
+          blank = alpha[t-1, s] + log_probs[t-1, u, blank_index]
+          prev = alpha[t-1, s] + log_probs[t-1, u-1, labels[s-1]]
+          elem = logsumexp(blank, prev)
+        else:
+          # we have for each non-blank label three incoming edges:
+          # (1) from the same label=same, (2) from blank=skip, (3) from previous label=prev
+          same = alpha[t-1, s]   + log_probs[t-1, u, labels[s]]
+          skip = alpha[t-1, s-1] + log_probs[t-1, u-1, blank_index]
+          prev = alpha[t-1, s-2] + log_probs[t-1, u-1, labels[s-1]]  # TODO: not sure about lp(..u-1..)
+          elem = logsumexp(same, skip, prev)
+      else:
+        u = s
+        skip = alpha[t - 1, u] + log_probs[t - 1, u, blank_index]
+        emit = alpha[t - 1, u - 1] + log_probs[t - 1, u - 1, labels[u - 1]]
+        elem = logsumexp(skip, emit)  # addition in linear-space -> LSE in log-space
+        print('t=%2d u=%2d: LSE(%.3f + %.3f, %.3f +  %.3f) = LSE(%.3f, %.3f) = %.3f' % (t, u,
+                                                                                        alpha[t - 1, u],
+                                                                                        log_probs[t - 1, u, blank_index],
+                                                                                        alpha[t - 1, u - 1],
+                                                                                        log_probs[t - 1, u - 1,
+                                                                                                  labels[u - 1]],
+                                                                                        skip, emit, elem))
+      alpha[t, s] = elem
 
   if debug:
     assert len(alpha.shape) == 2
     print("Alpha matrix: (%d, %d)" % tuple(alpha.shape))
     print(alpha)
-  nll = - alpha[n_time, n_target-1]
+  if label_loop:
+    # must end in final "blank" state or final non-blank-state
+    # -log[alpha(T, U) + alpha(T, U-1)]
+    nll = -logsumexp(alpha[n_time, max_targets-1], alpha[n_time, max_targets-2])
+  else:
+    nll = - alpha[n_time, n_target-1]
   if debug:
     print("negative log-likelihood = - alpha[%d, %d] = %.4f" %
           (n_time, n_target-1, nll))
   return alpha, nll
 
 
-def numpy_forward_shifted_batched(log_probs, labels, blank_index, input_lens, label_lens, debug=False):
+def numpy_forward_shifted_batched(log_probs, labels, blank_index, input_lens, label_lens, label_loop=False, debug=False):
   """Forward calculation of the RNA loss using the same diagonal strategy."""
   n_batch, max_time, max_target, n_vocab = log_probs.shape  # (B, T, U, V)
   assert labels.shape == (n_batch, max_target-1)  # (B, U-1)
@@ -242,7 +282,8 @@ def tf_shift_logprobs(mat, axis, axis_to_expand):
   return t[:, :, :-1, :]
 
 
-def tf_forward_shifted_rna(log_probs, labels, input_lengths=None, label_lengths=None, blank_index=0, debug=False):
+def tf_forward_shifted_rna(log_probs, labels, input_lengths=None, label_lengths=None, blank_index=0,
+                           label_loop=False, debug=False):
   """
   Computes the batched forward pass of the RNA model.
   B: batch, T: time, U:target/labels, V: vocabulary
@@ -252,6 +293,8 @@ def tf_forward_shifted_rna(log_probs, labels, input_lengths=None, label_lengths=
   :param tf.Tensor input_lengths: (B,) length of input frames
   :param tf.Tensor label_lengths: (B,) length of labels
   :param int blank_index: index of the blank symbol in the vocabulary
+  :param bool label_loop: whether we account for label repetitions,
+                          False for RNA-like, True for CTC topology
   :param bool debug: enable verbose logging
   :return:
   """
@@ -399,7 +442,7 @@ def tf_forward_shifted_rna(log_probs, labels, input_lengths=None, label_lengths=
 
 
 def test_impl(name, acts, labels, blank_index, input_lens=None, label_lens=None,
-              timing=False, debug=False):
+              label_loop=False, timing=False, debug=False):
   """
   runs the different implementations on the same data, comparing them.
 
@@ -409,6 +452,7 @@ def test_impl(name, acts, labels, blank_index, input_lens=None, label_lens=None,
   :param int blank_index:
   :param label_lens: (B,)|None
   :param input_lens: (B,)|None
+  :param bool label_loop: whether to allow label repetitions
   :param timing:
   :param debug:
   :return: costs, grads
@@ -455,13 +499,14 @@ def test_impl(name, acts, labels, blank_index, input_lens=None, label_lens=None,
     list_alphas.append(alphas)
     list_grads.append(analytical_grads)
 
-    # alpha_np, cost_np = numpy_forward(log_probs_i, labels_i, blank_index, debug)
+    _, cost_np = numpy_forward(log_probs_i, labels_i, blank_index, debug=debug, label_loop=label_loop)
+    np.testing.assert_almost_equal(cost_np, -ll_forward, decimal=4)
   costs_ref = np.stack(list_ll, axis=0)
   print_results("Reference", costs_ref, list_grads)
 
   costs_np = numpy_forward_shifted_batched(log_probs, labels, blank_index=blank_index,
                                            input_lens=input_lens, label_lens=label_lens,
-                                           debug=debug)
+                                           debug=debug, label_loop=label_loop)
   np.testing.assert_almost_equal(costs_np, costs_ref, decimal=5)
   print_results("NumPy", costs_np, None)
 
@@ -479,7 +524,9 @@ def test_impl(name, acts, labels, blank_index, input_lens=None, label_lens=None,
     costs_ph = tf_forward_shifted_rna(log_probs_ph, labels_ph,
                                       input_lengths=input_lengths_ph,
                                       label_lengths=label_lengths_ph,
-                                      blank_index=blank_index, debug=debug)
+                                      blank_index=blank_index,
+                                      label_loop=label_loop,
+                                      debug=debug)
     grads_ph = tf.gradients(xs=log_probs_ph, ys=[-costs_ph])[0]
     ll_tf, grads_tf = sess.run([costs_ph, grads_ph],
                                feed_dict={log_probs_ph: log_probs,
@@ -517,7 +564,7 @@ def test_small():
   output_len = 4
   acts = np.random.rand(input_len, output_len, vocab_size)
   labels = np.random.randint(1, vocab_size, output_len-1)
-  test_impl("test_small", acts, labels, blank_index)
+  test_impl("test_small", acts, labels, blank_index, label_loop=True)
 
 
 def test_size_t_greater_u():
@@ -634,9 +681,9 @@ if __name__ == '__main__':
   np.random.seed(42)
 
   test_small()
-  test_size_t_greater_u()
-  test_size_t_equal_u()
-  test_sizes()
-  test_blank_idx_nonzero()
-  test_batched()
-  test_big()
+  # test_size_t_greater_u()
+  # test_size_t_equal_u()
+  # test_sizes()
+  # test_blank_idx_nonzero()
+  # test_batched()
+  # test_big()
