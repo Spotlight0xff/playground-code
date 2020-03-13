@@ -58,31 +58,31 @@ def numpy_forward(log_probs, labels, blank_index, label_loop=False, debug=False)
   """Forward calculation of the RNA loss."""
   n_time, n_target, n_vocab = log_probs.shape  # (T, U, V)
 
-  max_targets = n_target
+  num_states = n_target
   if label_loop:
-    max_targets = 2*(n_target-1)+1
+    num_states = 2*(n_target-1)+1
     # TODO: do we need to merge the repeated labels?
     # insert before and in-between each label
     # repeat each label twice... TODO: cleaner?
     labels_tiled = np.tile(labels[:, np.newaxis], [1, 2]).reshape((-1,))  # (U,) -> (2*U)
     print("labels before:", labels)
-    labels = np.where(np.arange(max_targets-1) % 2 == 0, labels_tiled, np.ones_like(labels_tiled)*blank_index)
+    labels = np.where(np.arange(num_states-1) % 2 == 0, labels_tiled, np.ones_like(labels_tiled)*blank_index)
     labels = np.concatenate([[blank_index], labels])
-    assert len(labels) == max_targets
+    assert len(labels) == num_states
     print("labels after:", labels)
 
-  alpha = np.zeros((n_time+1, max_targets))  # 1 in log-space
-  print("a = alpha[t-1, u - 1] + log_probs[t - 1, u - 1, labels[u - 1]]")
-  print("b = alpha[t-1, u] + log_probs[t-1, u,  blank]")
-  print("alpha[t,u] = LSE(a,b)")
+  alpha = np.zeros((n_time+1, num_states))  # 1 in log-space
+  #print("a = alpha[t-1, u - 1] + log_probs[t - 1, u - 1, labels[u - 1]]")
+  #print("b = alpha[t-1, u] + log_probs[t-1, u,  blank]")
+  #print("alpha[t,u] = LSE(a,b)")
   debug = True
   if debug:
     print("U=%d, T=%d, V=%d" % (n_target, n_time, n_vocab))
 
   if label_loop:
-    # TODO, how to initialize
-    alpha[0, 0] = 0  #log_probs[0, ]
-    alpha[0, 1] = log_probs[0, 0, labels[0]]
+    # Basically CTC, see https://www.cs.toronto.edu/~graves/phd.pdf, Section 7,3
+    alpha[0, 1] = log_probs[0, 0, labels[0]]  # blank, eq 7.5
+    alpha[0, 2] = log_probs[0, 0, labels[1]]  # first non-blank, eq 7.6
 
   for t in range(1, n_time):
     # blank - blank - blank - ...
@@ -91,40 +91,63 @@ def numpy_forward(log_probs, labels, blank_index, label_loop=False, debug=False)
       t, t-1, t-1, blank_index, alpha[t - 1, 0], log_probs[t - 1, 0, blank_index], alpha[t, 0]))
 
     # label - label - label - ...
-    u = t
-    if u < max_targets:
-      alpha[t, u] = alpha[t-1, u-1] + log_probs[t-1, u-1, labels[u-1]]
+    # u = t
+    #if u < num_states:
+    #  alpha[t, u] = alpha[t-1, u-1] + log_probs[t-1, u-1, labels[u-1]]
 
   for t in range(1, n_time+1):
-    for s in range(1, min(t, n_target)):
+    for s in range(1, min(t, num_states)):
       if label_loop:
-        u = int(s/2)  # round down
+        label_idx = int(s/2)  # round down, label_idx
         # for the CTC model (basically RNA with label repetitions):
         # unfolded graph for CTC, see e.g. ASG paper, Figure 2 https://openreview.net/pdf?id=BkUDvt5gg
         # edge cases: t=0 (blank)
-        if s % 2 == 0:  # blank
-          # blank, two incoming edges: (1) same, again blank, (2) previous label
-          blank = alpha[t-1, s] + log_probs[t-1, u, blank_index]
-          prev = alpha[t-1, s] + log_probs[t-1, u-1, labels[s-1]]
+        if s % 2 == 0:  # blank, for s > 1
+        # if labels[s] == blank_index or (s>1 and (labels[s] == labels[s-2])):
+          # blank, two incoming edges: (1) again blank, (2) previous label
+          blank = alpha[t-1, s] + log_probs[t-1, label_idx, blank_index]
+          prev = alpha[t-1, s-1] + log_probs[t-1, label_idx, labels[s-1]]
+          print("t=%2d s=%2d: [BLANK] blank = alpha[%2d, %2d]   + log_probs[%2d, %2d, %2d] = %.3f" %
+                (t, s, t-1, s, t-1, label_idx, blank_index, blank))
+          print("t=%2d s=%2d: [BLANK] prev  = alpha[%2d, %2d]   + log_probs[%2d, %2d, %2d] = %.3f" %
+                (t, s, t-1, s-1, t-1, label_idx-1, labels[s-1], prev))
           elem = logsumexp(blank, prev)
-        else:
+        else:  # non-blank symbol
           # we have for each non-blank label three incoming edges:
-          # (1) from the same label=same, (2) from blank=skip, (3) from previous label=prev
-          same = alpha[t-1, s]   + log_probs[t-1, u, labels[s]]
-          skip = alpha[t-1, s-1] + log_probs[t-1, u-1, blank_index]
-          prev = alpha[t-1, s-2] + log_probs[t-1, u-1, labels[s-1]]  # TODO: not sure about lp(..u-1..)
-          elem = logsumexp(same, skip, prev)
+          # (1) from the same label=same, (2) from blank=blank, (3) from previous label=prev
+          same = alpha[t-1, s] + log_probs[t-1, label_idx, labels[label_idx]]
+          print("t=%2d s=%2d: [LABEL] same  = alpha[%2d, %2d]   + log_probs[%2d, %2d, %2d] = %.3f" %
+                (t, s, t-1, s,             t-1, label_idx, labels[label_idx], same))
+
+          blank = alpha[t-1, s-1] + log_probs[t-1, label_idx, blank_index]
+          print("t=%2d s=%2d: [LABEL] blank = alpha[%2d, %2d]   + log_probs[%2d, %2d, %2d] = %.3f" %
+                (t, s,  t-1, s-1,             t-1, label_idx, blank_index, blank))
+          if s > 1:  # not first label
+            # TODO: label_idx - 1: correct?
+            prev = alpha[t-1, s-2] + log_probs[t-1, label_idx-1, labels[s-1]]
+            print("t=%2d s=%2d: [LABEL] prev  = alpha[%2d, %2d]   + log_probs[%2d, %2d, %2d] = %.3f" %
+                  (t, s, t - 1, s - 2, t - 1, label_idx - 1, labels[s - 1], prev))
+          else:
+
+            prev = NEG_INF
+            print("t=%2d s=%2d: [LABEL] prev  = %.3f" %
+                  (t, s, prev))
+          elem = logsumexp(same, blank, prev)
       else:
-        u = s
-        skip = alpha[t - 1, u] + log_probs[t - 1, u, blank_index]
-        emit = alpha[t - 1, u - 1] + log_probs[t - 1, u - 1, labels[u - 1]]
+        # u = s
+        label_idx = s
+        skip = alpha[t - 1, label_idx] + log_probs[t - 1, label_idx, blank_index]
+
+        # TODO: label_idx - 1: correct?
+        emit = alpha[t - 1, label_idx - 1] + log_probs[t - 1, label_idx - 1, labels[label_idx - 1]]
         elem = logsumexp(skip, emit)  # addition in linear-space -> LSE in log-space
-        print('t=%2d u=%2d: LSE(%.3f + %.3f, %.3f +  %.3f) = LSE(%.3f, %.3f) = %.3f' % (t, u,
-                                                                                        alpha[t - 1, u],
-                                                                                        log_probs[t - 1, u, blank_index],
-                                                                                        alpha[t - 1, u - 1],
-                                                                                        log_probs[t - 1, u - 1,
-                                                                                                  labels[u - 1]],
+        print('t=%2d u=%2d: LSE(%.3f + %.3f, %.3f +  %.3f) = LSE(%.3f, %.3f) = %.3f' % (t, label_idx,
+                                                                                        alpha[t - 1, label_idx],
+                                                                                        log_probs[t - 1, label_idx,
+                                                                                                  blank_index],
+                                                                                        alpha[t - 1, label_idx - 1],
+                                                                                        log_probs[t - 1, label_idx - 1,
+                                                                                                  labels[label_idx - 1]],
                                                                                         skip, emit, elem))
       alpha[t, s] = elem
 
@@ -135,7 +158,7 @@ def numpy_forward(log_probs, labels, blank_index, label_loop=False, debug=False)
   if label_loop:
     # must end in final "blank" state or final non-blank-state
     # -log[alpha(T, U) + alpha(T, U-1)]
-    nll = -logsumexp(alpha[n_time, max_targets-1], alpha[n_time, max_targets-2])
+    nll = -logsumexp(alpha[n_time, num_states-1], alpha[n_time, num_states-2])
   else:
     nll = - alpha[n_time, n_target-1]
   if debug:
@@ -554,17 +577,28 @@ def test_impl(name, acts, labels, blank_index, input_lens=None, label_lens=None,
   return nll_tf, grads_tf
 
 
+def test_small_labelrep():
+  """Small test for label rep (CTC topology)"""
+  blank_index = 0
+  vocab_size = 5
+  input_len = 9
+  output_len = 4
+  acts = np.random.rand(input_len, output_len, vocab_size)
+  labels = np.array([1, 2, 3])
+  test_impl("test_small_labelrep", acts, labels, blank_index, label_loop=True)
+
+
 def test_small():
   """Small test, copied from
     https://github.com/awni/transducer/blob/master/ref_transduce.py
   """
   blank_index = 0
-  vocab_size = 4
-  input_len = 5
+  vocab_size = 5
+  input_len = 9
   output_len = 4
   acts = np.random.rand(input_len, output_len, vocab_size)
   labels = np.random.randint(1, vocab_size, output_len-1)
-  test_impl("test_small", acts, labels, blank_index, label_loop=True)
+  test_impl("test_small", acts, labels, blank_index)
 
 
 def test_size_t_greater_u():
@@ -680,7 +714,8 @@ if __name__ == '__main__':
 
   np.random.seed(42)
 
-  test_small()
+  test_small_labelrep()
+  # test_small()
   # test_size_t_greater_u()
   # test_size_t_equal_u()
   # test_sizes()
