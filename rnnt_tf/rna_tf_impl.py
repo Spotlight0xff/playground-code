@@ -359,13 +359,16 @@ def tf_forward_shifted_rna(log_probs, labels, input_lengths=None, label_lengths=
     """
     return tf.less(n, num_diagonals)
 
+  def add_scores(s_, y_):
+    return tf.where(tf.is_finite(s_), s_ + y_, s_)
+
   def body_forward(n, alpha_ta):
     """body of the while_loop, loops over the diagonals of the alpha-tensor."""
     # alpha(t-1,u-1) + logprobs(t-1, u-1)
     # alpha_blank      + lp_blank
 
     lp_diagonal = log_probs_ta.read(n-2)[:, :n-1, :]  # (B, U|n, V)
-    lp_diagonal = py_print_iteration_info("lp_diagonal", lp_diagonal, n, debug=debug)
+    # lp_diagonal = py_print_iteration_info("lp_diagonal", lp_diagonal, n, debug=debug)
 
     diag_maxlen = tf.reduce_min([max_target, n])
     prev_diagonal = alpha_ta.read(n-1)[:, :diag_maxlen]  # (B, n-1)
@@ -385,7 +388,7 @@ def tf_forward_shifted_rna(log_probs, labels, input_lengths=None, label_lengths=
     alpha_y = tf.concat([tf.tile([[tf.constant(NEG_INF)]], [n_batch, 1]), alpha_y], axis=1)
     alpha_y = py_print_iteration_info("alpha(y)", alpha_y, n, debug=debug)
 
-    labels_maxlen = tf.minimum(max_target-1, n-1)
+    labels_maxlen = tf.minimum(max_target, n-1)
     labels_shifted = labels[:, :labels_maxlen]  # (B, U-1|n-1)
     labels_shifted = py_print_iteration_info("labels_shifted", labels_shifted, n, debug=debug)
     batchs, rows = tf.meshgrid(
@@ -400,7 +403,7 @@ def tf_forward_shifted_rna(log_probs, labels, input_lengths=None, label_lengths=
     lp_y = tf.concat([tf.tile([[tf.constant(NEG_INF)]], [n_batch, 1]), lp_y], axis=1)
     lp_y = py_print_iteration_info("lp(y)", lp_y, n, debug=debug)
 
-    cut_off = max_target
+    cut_off = max_target + 1
     alpha_y = tf.cond(tf.greater(n, max_target),
                       lambda: alpha_y[:, :cut_off],
                       lambda: alpha_y)
@@ -412,13 +415,13 @@ def tf_forward_shifted_rna(log_probs, labels, input_lengths=None, label_lengths=
                           lambda: alpha_blank)
 
     # all should have shape (B, n)
-    blank = alpha_blank + lp_blank
-    y = alpha_y + lp_y
+    blank = add_scores(lp_blank, alpha_blank)
+    y = add_scores(lp_y, alpha_y)
     red_op = tf.stack([blank, y], axis=0)  # (2, B, N)
     red_op = py_print_iteration_info("red-op", red_op, n, debug=debug)
     new_diagonal = tf.math.reduce_logsumexp(red_op, axis=0)  # (B, N)
 
-    new_diagonal = new_diagonal[:, :n]
+    # new_diagonal = new_diagonal[:, :n+1]
     new_diagonal = py_print_iteration_info("new_diagonal", new_diagonal, n, debug=debug)
     return [n + 1, alpha_ta.write(n, new_diagonal)]
 
@@ -431,10 +434,10 @@ def tf_forward_shifted_rna(log_probs, labels, input_lengths=None, label_lengths=
   # ll_tf = final_alpha[n_time-1, n_target-1]
 
   # (B,): batch index -> diagonal index
-  diag_idxs = input_lengths +1   # (B,)
+  diag_idxs = input_lengths + 1   # (B,)
 
   # (B,): batch index -> index within diagonal
-  within_diag_idx = label_lengths
+  within_diag_idx = label_lengths - 1 #  TODO: check... correct for our setup, wrong for tests??
   within_diag_idx = tf.where(tf.less_equal(label_lengths, input_lengths),
       within_diag_idx,  # everything ok, T>U
       tf.ones_like(within_diag_idx) * -1)  #  U > T, not possible in RNA
@@ -453,8 +456,8 @@ def tf_forward_shifted_rna(log_probs, labels, input_lengths=None, label_lengths=
   def ta_read_body(i, res_loop_ta):
     """Reads from the alpha-diagonals TensorArray. We need this because of the inconsistent shapes in the TA."""
     ta_item = alpha_out_ta.read(diag_idxs[i])[i]
+    ta_item = py_print_iteration_info("FINAL", ta_item, i, "diag_idxs", diag_idxs, "within_diag_idx:",within_diag_idx, debug=debug)
     elem = tf.cond(tf.equal(within_diag_idx[i], -1), lambda: tf_neg_inf, lambda: ta_item[within_diag_idx[i]])
-    elem = py_print_iteration_info("FINAL", elem, i, "diag_idxs", diag_idxs, "within_diag_idx:",within_diag_idx, debug=debug)
     return i+1, res_loop_ta.write(i, elem)
 
   _, ll_ta = tf.while_loop(
