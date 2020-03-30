@@ -5,6 +5,7 @@
       <sourceFolder url="file://$MODULE_DIR$/rnnt_tf/returnn" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/rnnt_tf/returnn/extern" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/rnnt_tf" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/rnnt_tf/returnn/tests" isTestSource="false" />
     </content>
     <orderEntry type="jdk" jdkName="Python 3.6 (returnn)" jdkType="Python SDK" />
     <orderEntry type="sourceFolder" forTests="false" />
