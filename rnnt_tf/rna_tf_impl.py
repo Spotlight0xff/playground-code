@@ -107,12 +107,12 @@ def numpy_forward(log_probs, labels, blank_index, debug=False):
 def numpy_forward_shifted_batched(log_probs, labels, blank_index, input_lens, label_lens, debug=False):
   """Forward calculation of the RNA loss using the same diagonal strategy."""
   n_batch, max_time, max_target, n_vocab = log_probs.shape  # (B, T, U, V)
-  assert labels.shape == (n_batch, max_target-1)  # (B, U-1)
+  # assert labels.shape == (n_batch, max_target-1)  # (B, U-1)
   if debug:
-    print("U=%d, T=%d, V=%d" % (max_target, max_time, n_vocab))
-    print("log-probs: (B=%d, T=%d, U=%d, V=%d)" % (n_batch, max_time, max_target, n_vocab))
+    print("U=%d, T=%d, V=%d" % (max_target-1, max_time, n_vocab))
+    print("log-probs: (B=%d, T=%d, U+1=%d, V=%d)" % (n_batch, max_time, max_target, n_vocab))
     print("labels: (B=%d, U-1=%d)" % (n_batch, labels.shape[1]))
-  num_diagonals = max_time + max_target
+  # num_diagonals = max_time + max_target
 
   def print_debug(n, *vars):
     """Some basic debug information printing."""
@@ -176,7 +176,7 @@ def numpy_forward_shifted_batched(log_probs, labels, blank_index, input_lens, la
     print_debug(n, colored("y", "red"), y)
     new_diagonal = np.logaddexp(blank, y)  # (B, N)
 
-    new_diagonal = new_diagonal[:, :n]
+    # new_diagonal = new_diagonal[:, :n]
     print_debug(n, "new_diagonal", new_diagonal)
     alphas.append(new_diagonal)  # s.t. alphas[n] == new_diagonal
 
@@ -195,7 +195,7 @@ def numpy_forward_shifted_batched(log_probs, labels, blank_index, input_lens, la
     a = ta_item[i, within_diag_idx[i]]
     # b = log_probs[i, input_lens[i]-1, label_lens[i], blank_index]
     if debug:
-      print("FINAL i=%d, diag_idx=%d, within_diag_idx=%d" % (i, diag_idxs[i], within_diag_idx[i]))
+      print("FINAL i=%d, diag_idx=%d, within_diag_idx=%d, diag=%r" % (i, diag_idxs[i], within_diag_idx[i], ta_item[i]))
       print("FINAL i=%d" % i, "NLL=%.3f" % (-a))
     nll = - a # + b
     list_nll.append(nll)
@@ -247,8 +247,8 @@ def tf_forward_shifted_rna(log_probs, labels, input_lengths=None, label_lengths=
   Computes the batched forward pass of the RNA model.
   B: batch, T: time, U:target/labels, V: vocabulary
 
-  :param tf.Tensor log_probs: (B, T, U, V) log-probabilities
-  :param tf.Tensor labels: (B, U-1) -> [V] labels
+  :param tf.Tensor log_probs: (B, T, U+1, V) log-probabilities
+  :param tf.Tensor labels: (B, U) -> [V] labels
   :param tf.Tensor input_lengths: (B,) length of input frames
   :param tf.Tensor label_lengths: (B,) length of labels
   :param int blank_index: index of the blank symbol in the vocabulary
@@ -509,12 +509,14 @@ def test_impl(name, acts, labels, blank_index, input_lens=None, label_lens=None,
       run_options = tf.RunOptions(trace_level=tf.RunOptions.FULL_TRACE)
       run_metadata = tf.RunMetadata()
       tf_run_opts = {'options': run_options, 'run_metadata': run_metadata}
-
-    costs_ph = tf_forward_shifted_rna(log_probs_ph, labels_ph,
-                                      input_lengths=input_lengths_ph,
-                                      label_lengths=label_lengths_ph,
-                                      blank_index=blank_index, debug=debug)
-    grads_ph = tf.gradients(xs=log_probs_ph, ys=[-costs_ph])[0]
+    with tf.device("/cpu:0"):  # run on CPU, so that TF doesn't hog the GPU
+      costs_ph = tf_forward_shifted_rna(log_probs_ph, labels_ph,
+                                        input_lengths=input_lengths_ph,
+                                        label_lengths=label_lengths_ph,
+                                        blank_index=blank_index, debug=debug)
+      grads_ph = tf.gradients(xs=log_probs_ph, ys=[-costs_ph])
+    assert len(grads_ph) == 1
+    grads_ph = grads_ph[0]
     ll_tf, grads_tf = sess.run([costs_ph, grads_ph],
                                feed_dict={log_probs_ph: log_probs,
                                           labels_ph: labels,
@@ -601,53 +603,73 @@ def test_blank_idx_nonzero():
     test_impl("test_blank_idx (%d)" % blank_index, acts, labels, blank_index=blank_index)
 
 
+def test_real():
+  blank_index = 1030
+  item = np.load("/work/data/debug-rna-impl/debug-globalstep529839.npz")
+  log_probs = item["log_probs"]  # (B, T, U+1, V)
+
+  n_batch, n_time, n_target, n_vocab = log_probs.shape
+  log_probs = np.concatenate([log_probs, np.random.random((n_batch, n_time, 1, n_vocab))], axis=2)  # add +1 to outputlen, bug in config!!!
+  assert log_probs.shape == (n_batch, n_time, n_target+1, n_vocab)
+  # log_probs = log_probs[:, :, :-1, :]
+
+  # targets = np.concatenate([item["targets"], np.reshape([0]*n_batch, (n_batch, 1))], axis=1)  # (B, U) -> (B, U+1)
+  targets = item["targets"]
+
+  enc_lens = item["enc_lens"]
+  dec_lens = item["dec_lens"]
+
+  # print("enc lens  :", enc_lens)
+  # print("dec lens  :", dec_lens)
+  # print("targets   :", targets.shape)
+  # print("log probs :", log_probs.shape)
+
+  assert np.isfinite(log_probs).all()
+
+  assert enc_lens.shape == (n_batch,)
+  assert dec_lens.shape == (n_batch,)
+  assert targets.shape == (n_batch, n_target)
+  test_impl("test_real", log_probs, labels=targets, blank_index=blank_index, input_lens=enc_lens,
+            label_lens=dec_lens, timing=False)  # , log_probs=log_probs, debug=True)
+
+
 def test_batched():
-  """https://github.com/awni/transducer/blob/master/test.py
-  check only first in mini batch.
+  """Check batched, different output/input lengths.
   """
-  acts = np.array(
-    [
-      [[[0.06535690384862791, 0.7875301411923206, 0.08159176605666074],
-        [0.5297155426466327, 0.7506749639230854, 0.7541348379087998],
-        [0.6097641124736383, 0.8681404965673826, 0.6225318186056529]],
+  n_batch = 8
+  n_time = 15
+  n_target = 7
+  n_vocab = 5
+  acts = np.random.standard_normal((n_batch, n_time, n_target, n_vocab))
+  for i in range(8):
+    label_lengths = np.random.randint(1, n_target, (n_batch,))  # [1, U)
+    input_lengths = label_lengths + np.random.randint(0, n_time-n_target, (n_batch,))
+    labels = np.random.randint(1, n_vocab-1, (n_batch, n_target-1,))  # except blank=0
+    test_impl("batched(%d): T=%r, U=%r" % (i, input_lengths, label_lengths), acts, labels, blank_index=0, input_lens=input_lengths,
+              label_lens=label_lengths, timing=False)
 
-       [[0.6685222872103057, 0.8580392805336061, 0.16453892311765583],
-        [0.989779515236694, 0.944298460961015, 0.6031678586829663],
-        [0.9467833543605416, 0.666202507295747, 0.28688179752461884]],
 
-       [[0.09418426230195986, 0.3666735970751962, 0.736168049462793],
-        [0.1666804425271342, 0.7141542198635192, 0.3993997272216727],
-        [0.5359823524146038, 0.29182076440286386, 0.6126422611507932]],
-
-       [[0.3242405528768486, 0.8007644367291621, 0.5241057606558068],
-        [0.779194617063042, 0.18331417220174862, 0.113745182072432],
-        [0.24022162381327106, 0.3394695622533106, 0.1341595066017014]]],
-
-      [[[0.5055615569388828, 0.051597282072282646, 0.6402903936686337],
-        [0.43073311517251, 0.8294731834714112, 0.1774668847323424],
-        [0.3207001991262245, 0.04288308912457006, 0.30280282975568984]],
-
-       [[0.6751777088333762, 0.569537369330242, 0.5584738347504452],
-        [0.08313242153985256, 0.06016544344162322, 0.10795752845152584],
-        [0.7486153608562472, 0.943918041459349, 0.4863558118797222]],
-
-       [[0.4181986264486809, 0.6524078485043804, 0.024242983423721887],
-        [0.13458171554507403, 0.3663418070512402, 0.2958297395361563],
-        [0.9236695822497084, 0.6899291482654177, 0.7418981733448822]],
-
-       [[0.25000547599982104, 0.6034295486281007, 0.9872887878887768],
-        [0.5926057265215715, 0.8846724004467684, 0.5434495396894328],
-        [0.6607698886038497, 0.3771277082495921, 0.3580209022231813]]]])
-
-  n_batch, n_time, n_labels, n_vocab = acts.shape
-  input_lengths = np.array([4]*n_batch)
-
-  labels = np.array([[1, 2], [1, 1]])
-  label_lengths = np.array([2] * n_batch)
-
-  test_impl("batched", acts, labels, blank_index=0, input_lens=input_lengths,
-            label_lens=label_lengths, timing=False)
-
+def test_batched_tiled():
+  """
+  Tiled across batch-dim, so that every i in the batch is the same.
+  Except for the label/input lengths.
+  Better for debugging.
+  """
+  n_batch = 8
+  n_time = 4
+  n_target = 3
+  n_vocab = 5
+  acts = np.random.standard_normal((1, n_time, n_target, n_vocab))
+  acts = np.tile(acts, [n_batch, 1, 1, 1])
+  for i in range(8):
+    label_lengths = np.random.randint(1, n_target, (n_batch,))  # [1, U)
+    input_lengths = np.array([n_time] * (n_batch-1))
+    input_lengths = np.concatenate([input_lengths, [n_time-1]])
+    # labels = np.random.randint(1, n_vocab-1, (n_batch, n_target-1,))  # except blank=0
+    labels = np.random.randint(1, n_vocab - 1, (1, n_target - 1,))  # except blank=0
+    labels = np.tile(labels, [n_batch, 1])
+    test_impl("batched(%d): T=%r, U=%r" % (i, input_lengths, label_lengths), acts, labels, blank_index=0, input_lens=input_lengths,
+              label_lens=label_lengths, timing=False)
 
 def test_big():
   """Big test, with timing.
@@ -669,10 +691,12 @@ if __name__ == '__main__':
 
   np.random.seed(42)
 
+  test_real()
+  test_batched()
+  test_batched_tiled()
   test_small()
   test_size_t_greater_u()
   test_size_t_equal_u()
   test_sizes()
   test_blank_idx_nonzero()
-  test_batched()
   test_big()
