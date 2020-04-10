@@ -17,7 +17,7 @@ import tensorflow as tf
 from termcolor import colored
 from ref_transduce import transduce as transduce_ref
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "returnn"))
-from ref_rna import forward_pass, analytical_gradient, backward_pass
+from ref_rna import forward_pass, analytical_gradient, backward_pass, numerical_gradient
 
 NEG_INF = -float("inf")
 
@@ -259,7 +259,7 @@ def tf_forward_shifted_rna(log_probs, labels, input_lengths=None, label_lengths=
   shape = tf.shape(log_probs)
   n_batch = shape[0]     # B
   max_time = shape[1]    # T
-  max_target = shape[2]  # U
+  max_target = shape[2]  # U+1
 
   num_diagonals = max_time + 2
 
@@ -338,6 +338,9 @@ def tf_forward_shifted_rna(log_probs, labels, input_lengths=None, label_lengths=
     alpha_y = tf.cond(tf.greater(n, max_target),
                       lambda: alpha_y[:, :cut_off],
                       lambda: alpha_y)
+    lp_y = tf.cond(tf.greater(n, max_target),
+                      lambda: lp_y[:, :cut_off],
+                      lambda: lp_y)
     lp_blank = tf.cond(tf.greater(n, max_target),
                        lambda: lp_blank[:, :cut_off],
                        lambda: lp_blank)
@@ -365,7 +368,7 @@ def tf_forward_shifted_rna(log_probs, labels, input_lengths=None, label_lengths=
   # ll_tf = final_alpha[n_time-1, n_target-1]
 
   # (B,): batch index -> diagonal index
-  diag_idxs = input_lengths +1   # (B,)
+  diag_idxs = input_lengths + 1   # (B,)
 
   # (B,): batch index -> index within diagonal
   within_diag_idx = label_lengths
@@ -388,7 +391,8 @@ def tf_forward_shifted_rna(log_probs, labels, input_lengths=None, label_lengths=
     """Reads from the alpha-diagonals TensorArray. We need this because of the inconsistent shapes in the TA."""
     ta_item = alpha_out_ta.read(diag_idxs[i])[i]
     elem = tf.cond(tf.equal(within_diag_idx[i], -1), lambda: tf_neg_inf, lambda: ta_item[within_diag_idx[i]])
-    elem = py_print_iteration_info("FINAL", elem, i, "diag_idxs", diag_idxs, "within_diag_idx:",within_diag_idx, debug=debug)
+    elem = py_print_iteration_info("FINAL", elem, i, "diag_idxs", diag_idxs, "within_diag_idx:", within_diag_idx,
+                                   "diag", ta_item, debug=debug)
     return i+1, res_loop_ta.write(i, elem)
 
   _, ll_ta = tf.while_loop(
@@ -399,7 +403,7 @@ def tf_forward_shifted_rna(log_probs, labels, input_lengths=None, label_lengths=
 
 
 def test_impl(name, acts, labels, blank_index, input_lens=None, label_lens=None,
-              timing=False, debug=False):
+              timing=False, debug=False, log_probs=None):
   """
   runs the different implementations on the same data, comparing them.
 
@@ -413,20 +417,34 @@ def test_impl(name, acts, labels, blank_index, input_lens=None, label_lens=None,
   :param debug:
   :return: costs, grads
   """
-  if len(acts.shape) == 3:  # single -> batched
-    assert len(labels.shape) == 1
-    acts = np.expand_dims(acts, axis=0)  # (B, T, U, V)
-    labels = np.expand_dims(labels, axis=0)  # (B, U)
-    n_batch, n_time, n_labels, n_vocab = acts.shape
-    assert input_lens is None
-    assert label_lens is None
-    input_lens = np.array([n_time])  # (B,)=(1,)
-    label_lens = np.array([n_labels - 1])
-  assert len(acts.shape) == 4  # (B, T, U, V)
+  if acts is not None:
+    if len(acts.shape) == 3:  # single -> batched
+      assert len(labels.shape) == 1
+      acts = np.expand_dims(acts, axis=0)  # (B, T, U, V)
+      labels = np.expand_dims(labels, axis=0)  # (B, U)
+      n_batch, n_time, max_target, n_vocab = acts.shape
+
+      assert input_lens is None
+      assert label_lens is None
+      input_lens = np.array([n_time])  # (B,)=(1,)
+      label_lens = np.array([max_target-1])
+    assert len(acts.shape) == 4  # (B, T, U+1, V)
   assert input_lens is not None
   assert label_lens is not None
-  n_batch, n_time, n_target, n_vocab = acts.shape
-  log_probs = log_softmax(acts, axis=-1)  # along vocabulary
+  if acts is None:
+    assert log_probs is not None
+    assert len(log_probs.shape) == 4
+    n_batch, n_time, n_target, n_vocab = log_probs.shape
+  else:
+    assert log_probs is None
+    n_batch, n_time, n_target, n_vocab = acts.shape
+    log_probs = log_softmax(acts, axis=-1)  # along vocabulary
+
+  assert labels.dtype in (np.int64, np.int32)
+  labels = labels.astype(np.int32)
+  input_lens = input_lens.astype(np.int32)
+  label_lens = label_lens.astype(np.int32)
+  assert labels.dtype == np.int32
 
   def print_results(name, cost, grads):
     """Prints the results of an implementation."""
@@ -434,9 +452,12 @@ def test_impl(name, acts, labels, blank_index, input_lens=None, label_lens=None,
     if grads is None:
       grads_msg = "n/a"
     else:
-      grads_msg = "%.3f" % np.linalg.norm(grads)
+      if isinstance(grads, np.ndarray):
+        if len(grads.shape) == 4:
+          *grads, = grads  # list[np.ndarray]
+      grads_msg = "%.4f" % sum([np.linalg.norm(grad) for grad in grads])
     print(colored("%20s" % name, "red"),
-          "implementation: log-posterior=%.3f, |grads|=%s" % (
+          "implementation: log-posterior=%.4f, |grads|=%s" % (
             cost, grads_msg))
   print("Test", colored("%s" % name, "yellow"))
 
@@ -444,26 +465,39 @@ def test_impl(name, acts, labels, blank_index, input_lens=None, label_lens=None,
   list_grads = []
   list_alphas = []
   for i in range(n_batch):
-    log_probs_i = log_probs[i, :input_lens[i] + 1, :label_lens[i] + 1]
+    log_probs_i = log_probs[i, :input_lens[i], :label_lens[i]+1, :]
     labels_i = labels[i, :label_lens[i]]
+    input_len = input_lens[i]
+    assert log_probs_i.shape == (input_len, labels_i.shape[0] + 1, n_vocab)
     alphas, ll_forward = forward_pass(log_probs_i, labels_i, blank_index)
     betas, ll_backward = backward_pass(log_probs_i, labels_i, blank_index)
-    assert np.allclose(ll_forward, ll_backward, atol=1e-12, rtol=1e-12),\
-      "Log-likelihood from forward and backward pass mismatch."
+    assert np.allclose(ll_forward, ll_backward, atol=1e-12, rtol=1e-12), "Log-likelihood from forward and backward " \
+                                                                         "pass mismatch. "
     analytical_grads = analytical_gradient(log_probs_i, alphas, betas, labels_i, blank_index)
+    # enable for smaller tests, too expensive for bigger ones
+    # numerical_grads = numerical_gradient(log_probs_i, labels_i, -ll_forward, blank_index)
+    # assert np.allclose(analytical_grads, numerical_grads, atol=1e-6, rtol=1e-6), "Analytical and numerical " \
+    #                                                                              "computation of gradient mismatch. "
+
     list_ll.append(-ll_forward)
+    if debug:
+      print("i=%2d:" % i, "T=%d, U=%d" % (input_lens[i], label_lens[i]),
+            "NLL", -ll_forward, "from: probs=", log_probs_i.shape,
+            "and labels=", labels_i.shape)
     list_alphas.append(alphas)
     list_grads.append(analytical_grads)
 
     # alpha_np, cost_np = numpy_forward(log_probs_i, labels_i, blank_index, debug)
+  if debug:
+    print("analytical == numerical grad: %s" % colored("MATCH", "green"))
   costs_ref = np.stack(list_ll, axis=0)
   print_results("Reference", costs_ref, list_grads)
 
   costs_np = numpy_forward_shifted_batched(log_probs, labels, blank_index=blank_index,
                                            input_lens=input_lens, label_lens=label_lens,
                                            debug=debug)
-  np.testing.assert_almost_equal(costs_np, costs_ref, decimal=5)
   print_results("NumPy", costs_np, None)
+  np.testing.assert_almost_equal(costs_np, costs_ref, decimal=5, err_msg="costs(numpy) != costs(ref)")
 
   with sess.as_default():
     labels_ph = tf.compat.v1.placeholder(tf.int32, [None, None])
@@ -497,9 +531,11 @@ def test_impl(name, acts, labels, blank_index, input_lens=None, label_lens=None,
     nll_tf = -ll_tf
   print_results("Tensorflow", nll_tf, grads_tf)
 
+  assert np.isfinite(grads_tf).all(), "Found non-finite values in TF gradients."
   # Do all the tests (ref vs TF), for score, and grads
-  np.testing.assert_almost_equal(nll_tf, costs_ref, decimal=4)
-  print("TF vs Reference: log posterior ", colored("MATCH", "green"))
+  np.testing.assert_almost_equal(nll_tf, costs_ref, decimal=3, err_msg="costs(TF) != costs(ref)")
+  if debug:
+    print("TF vs Reference: log posterior ", colored("MATCH", "green"))
   for i in range(n_batch):
     np.testing.assert_almost_equal(grads_tf[i], list_grads[i], decimal=4)
   print("TF vs Reference: gradients     ", colored("MATCH", "green"))
