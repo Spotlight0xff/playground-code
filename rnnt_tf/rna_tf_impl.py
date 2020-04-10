@@ -15,6 +15,7 @@ import sys
 import numpy as np
 import tensorflow as tf
 from termcolor import colored
+from warp_rna import rna_loss
 from ref_transduce import transduce as transduce_ref
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "returnn"))
 from ref_rna import forward_pass, analytical_gradient, backward_pass, numerical_gradient
@@ -539,8 +540,27 @@ def test_impl(name, acts, labels, blank_index, input_lens=None, label_lens=None,
   if debug:
     print("TF vs Reference: log posterior ", colored("MATCH", "green"))
   for i in range(n_batch):
-    np.testing.assert_almost_equal(grads_tf[i], list_grads[i], decimal=4)
-  print("TF vs Reference: gradients     ", colored("MATCH", "green"))
+    np.testing.assert_almost_equal(
+        grads_tf[i, :input_lens[i], :label_lens[i]+1],
+        list_grads[i], decimal=4)
+  if debug:
+    print("TF vs Reference: gradients     ", colored("MATCH", "green"))
+
+  import torch
+  log_probs_pt = torch.from_numpy(log_probs).float()
+  log_probs_pt.requires_grad_(True)
+  costs_pt = rna_loss(log_probs_pt.cuda(),
+                      torch.from_numpy(labels).cuda(),
+                      torch.from_numpy(input_lens).cuda(),
+                      torch.from_numpy(label_lens).cuda(),
+                      average_frames=False, blank=blank_index)
+  costs_pt.sum().backward()
+  grads_pt = log_probs_pt.grad
+  print_results("PyTorch", costs_pt.detach().cpu().numpy(), grads_pt.numpy())
+  np.testing.assert_almost_equal(nll_tf, costs_pt.detach().cpu().numpy(), decimal=3,
+                                 err_msg="costs(TF) != costs(PyTorch)")
+  np.testing.assert_almost_equal(grads_tf, grads_pt.numpy(), decimal=3,
+                                 err_msg="grads(TF) != grads(PyTorch)")
   print()
   return nll_tf, grads_tf
 
