@@ -628,7 +628,11 @@ def test_blank_idx_nonzero():
 
 def test_real():
   blank_index = 1030
-  item = np.load("/work/data/debug-rna-impl/debug-globalstep529839.npz")
+  fpath = "/work/data/debug-rna-impl/debug-globalstep529839.npz"
+  if not os.path.exists(fpath):
+    print("Skipping test 'real' due to missing file '%s'." % fpath)
+    return
+  item = np.load(fpath)
   log_probs = item["log_probs"]  # (B, T, U+1, V)
 
   n_batch, n_time, n_target, n_vocab = log_probs.shape
