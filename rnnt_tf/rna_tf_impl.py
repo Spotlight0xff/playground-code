@@ -560,9 +560,9 @@ def test_impl(name, acts, labels, blank_index, input_lens=None, label_lens=None,
                                    err_msg="costs(TF) != costs(PyTorch)")
     np.testing.assert_almost_equal(grads_tf, grads_pt.numpy(), decimal=3,
                                    err_msg="grads(TF) != grads(PyTorch)")
-  except ModuleNotFoundError:
+  except ImportError:
     print(colored("%20s" % "PyTorch", "red"),
-          "implementation: module not found.")
+          "implementation: %s" % colored("module not found.", "orange"))
     print("")
   print()
   return nll_tf, grads_tf
@@ -638,9 +638,7 @@ def test_real():
   n_batch, n_time, n_target, n_vocab = log_probs.shape
   log_probs = np.concatenate([log_probs, np.random.random((n_batch, n_time, 1, n_vocab))], axis=2)  # add +1 to outputlen, bug in config!!!
   assert log_probs.shape == (n_batch, n_time, n_target+1, n_vocab)
-  # log_probs = log_probs[:, :, :-1, :]
 
-  # targets = np.concatenate([item["targets"], np.reshape([0]*n_batch, (n_batch, 1))], axis=1)  # (B, U) -> (B, U+1)
   targets = item["targets"]
 
   enc_lens = item["enc_lens"]
