@@ -562,7 +562,7 @@ def test_impl(name, acts, labels, blank_index, input_lens=None, label_lens=None,
                                    err_msg="grads(TF) != grads(PyTorch)")
   except ImportError:
     print(colored("%20s" % "PyTorch", "red"),
-          "implementation: %s" % colored("module not found.", "orange"))
+          "implementation: %s" % colored("module not found.", "yellow"))
     print("")
   print()
   return nll_tf, grads_tf
