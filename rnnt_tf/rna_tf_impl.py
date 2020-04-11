@@ -105,47 +105,44 @@ def numpy_forward(log_probs, labels, blank_index, debug=False):
 
 
 def numpy_forward_shifted_batched(log_probs, labels, blank_index, input_lens, label_lens, debug=False):
-  """Forward calculation of the RNA loss using the same diagonal strategy."""
+  """Forward calculation of the RNA loss using the same strategy as the TF impl."""
   n_batch, max_time, max_target, n_vocab = log_probs.shape  # (B, T, U, V)
-  # assert labels.shape == (n_batch, max_target-1)  # (B, U-1)
+  assert labels.shape == (n_batch, max_target-1)  # (B, U-1)
   if debug:
     print("U=%d, T=%d, V=%d" % (max_target-1, max_time, n_vocab))
     print("log-probs: (B=%d, T=%d, U+1=%d, V=%d)" % (n_batch, max_time, max_target, n_vocab))
     print("labels: (B=%d, U-1=%d)" % (n_batch, labels.shape[1]))
-  # num_diagonals = max_time + max_target
 
   def print_debug(n, *vars):
     """Some basic debug information printing."""
     if debug:
       print("[n=%2d]" % n, *vars)
-  # alpha diagonals
+  # alpha columns
   alphas = [[], np.zeros((n_batch, 1))]
 
   for n in range(2, max_time+2):
     # actually previous one.
-    lp_diagonal = log_probs[:, n-2, :n-1]
-    # lp_diagonal = shifted_logprobs[:, n-2, :n-1]  # (B, n-1, V)
-    print_debug(n, "lp_diagonal", lp_diagonal)
+    lp_column = log_probs[:, n-2, :n-1]
+    print_debug(n, "lp_column", lp_column)
 
-    diag_maxlen = min(max_target, n)
-    prev_diagonal = alphas[n-1][:, :diag_maxlen]
-    print_debug(n, "prev_diagonal", prev_diagonal)
+    col_maxlen = min(max_target, n)
+    prev_column = alphas[n-1][:, :col_maxlen]
+    print_debug(n, "prev_column", prev_column)
 
-    alpha_blank = prev_diagonal  # (B, N)
+    alpha_blank = prev_column  # (B, N)
     alpha_blank = np.concatenate([alpha_blank, np.tile([[NEG_INF]], [n_batch, 1])], axis=1)
 
     # (B, U, V) -> (B, U)
-    lp_blank = lp_diagonal[:, :, blank_index]  # (B, U)
+    lp_blank = lp_column[:, :, blank_index]  # (B, U)
     lp_blank = np.concatenate([lp_blank, np.tile([[NEG_INF]], [n_batch, 1])], axis=1)
 
-    alpha_y = prev_diagonal
+    alpha_y = prev_column
     alpha_y = np.concatenate([np.tile([[NEG_INF]], [n_batch, 1]), alpha_y], axis=1)
 
     # NOTE:
-    # We compute the diagonals from bottom-left to top-right.
-    # However, we cut off the diagonals in the top-right corner,
+    # We cut off the columns in the top-right corner,
     # as soon as we can make sure there are no interesting values.
-    # this happens when n > U.
+    # this happens when n > U. This makes sure all values have the same shape.
     cut_off = max_target
     if n > cut_off:  # phase (c), cut off top-right
       alpha_y = alpha_y[:, :cut_off]
@@ -160,7 +157,7 @@ def numpy_forward_shifted_batched(log_probs, labels, blank_index, input_lens, la
       np.arange(np.shape(labels_shifted)[1]),  # U-1
       indexing='ij'
     )
-    lp_y = lp_diagonal[batchs_idxs, rows_idxs, labels_shifted]
+    lp_y = lp_column[batchs_idxs, rows_idxs, labels_shifted]
     lp_y = np.concatenate([np.tile([[NEG_INF]], [n_batch, 1]), lp_y], axis=1)
 
     # all should have shape (B, n)
@@ -174,72 +171,32 @@ def numpy_forward_shifted_batched(log_probs, labels, blank_index, input_lens, la
     print_debug(n, colored("alpha_y", "red"), alpha_y)
     y = alpha_y + lp_y
     print_debug(n, colored("y", "red"), y)
-    new_diagonal = np.logaddexp(blank, y)  # (B, N)
+    new_column = np.logaddexp(blank, y)  # (B, N)
 
-    # new_diagonal = new_diagonal[:, :n]
-    print_debug(n, "new_diagonal", new_diagonal)
-    alphas.append(new_diagonal)  # s.t. alphas[n] == new_diagonal
+    # new_column = new_column[:, :n]
+    print_debug(n, "new_column", new_column)
+    alphas.append(new_column)  # s.t. alphas[n] == new_column
 
     if debug:
       print("\n")
 
   list_nll = []
-  diag_idxs = input_lens + 1  # (B,)
+  col_idxs = input_lens + 1  # (B,)
 
-  # (B,): batch index -> index within diagonal
+  # (B,): batch index -> index within column
   # We need to handle the U>T case for each example.
-  within_diag_idx = label_lens
+  within_col_idx = label_lens
   for i in range(n_batch):
-    ta_item = alphas[diag_idxs[i]]  # (B, N)
+    ta_item = alphas[col_idxs[i]]  # (B, N)
 
-    a = ta_item[i, within_diag_idx[i]]
+    a = ta_item[i, within_col_idx[i]]
     # b = log_probs[i, input_lens[i]-1, label_lens[i], blank_index]
     if debug:
-      print("FINAL i=%d, diag_idx=%d, within_diag_idx=%d, diag=%r" % (i, diag_idxs[i], within_diag_idx[i], ta_item[i]))
+      print("FINAL i=%d, col_idx=%d, within_col_idx=%d, col=%r" % (i, col_idxs[i], within_col_idx[i], ta_item[i]))
       print("FINAL i=%d" % i, "NLL=%.3f" % (-a))
-    nll = - a # + b
+    nll = -a  # + b
     list_nll.append(nll)
   return np.array(list_nll)  # (B,)
-
-
-def tf_shift_logprobs(mat, axis, axis_to_expand):
-  """
-  Shifts the log-probs per-batch row-wise.
-
-  :param mat: (B, U, T, V)
-  :param axis:
-  :param axis_to_expand:
-  :return: (B, T+U+1, U, V)
-  """
-  # mat: (B, T, U, V)
-  # axis_to_expand: usually U
-  # axis: usually T
-  # batch-axis has to be first
-  max_time = tf.shape(mat)[axis]  # T
-  n_batch = tf.shape(mat)[0]
-  max_target = tf.shape(mat)[axis_to_expand]
-  n_vocab = tf.shape(mat)[-1]
-  shifts = tf.expand_dims(tf.cast(tf.range(max_time), tf.float32), axis=1)  # (T,1)
-  shifts = shifts[tf.newaxis, :, :, tf.newaxis]
-  shifts = tf.tile(shifts, [n_batch, 1, 1, n_vocab])
-  pads = tf.zeros((n_batch, max_time, max_time, n_vocab), dtype=tf.float32)
-  # (B, T, 1, V) ; (B, T, U, V) ; (B, T, T, V)
-  # -> (B, T, U+T+1, V)
-  a_ranged = tf.concat([shifts, mat, pads], axis=axis_to_expand)  # (T, U+1)
-
-  def fn(x):  # x: (B, U+T+1, V)
-    """Computes the shift per diagonal and pads accordingly."""
-    shift = tf.cast(x[0][0][0], tf.int32)  # (B,)
-    # 1:U+1 is the original data, in front: shift as wanted, back: padding for shape
-    n = tf.pad(x[:, 1:max_target + 1, :], [[0, 0],  # B
-                                           [shift, max_time + 1 - shift],  # U+T+1
-                                           [0, 0]  # V
-                                           ], constant_values=0)
-    return n
-
-  t = tf.map_fn(fn, elems=tf.transpose(a_ranged, [1, 0, 2, 3]))
-  t = tf.transpose(t, [1, 0, 2, 3])
-  return t[:, :, :-1, :]
 
 
 def tf_forward_shifted_rna(log_probs, labels, input_lengths=None, label_lengths=None, blank_index=0, debug=False):
@@ -261,14 +218,14 @@ def tf_forward_shifted_rna(log_probs, labels, input_lengths=None, label_lengths=
   max_time = shape[1]    # T
   max_target = shape[2]  # U+1
 
-  num_diagonals = max_time + 2
+  num_columns = max_time + 2
 
   labels = py_print_iteration_info("labels", labels, 0, debug=debug)
 
   log_probs_ta = tf.TensorArray(
     dtype=tf.float32,
     clear_after_read=False,
-    size=num_diagonals,
+    size=num_columns,
     dynamic_size=False,
     infer_shape=False,
     element_shape=(None, None, None),  # (B, U, V)
@@ -280,42 +237,42 @@ def tf_forward_shifted_rna(log_probs, labels, input_lengths=None, label_lengths=
   alpha_ta = tf.TensorArray(
     dtype=tf.float32,
     clear_after_read=False,
-    size=num_diagonals,
+    size=num_columns,
     dynamic_size=False,
     infer_shape=False,
     element_shape=(None, None,),  # (B, n)
-    name="alpha_diagonals",
+    name="alpha_columns",
   )
   alpha_ta = alpha_ta.write(1, tf.zeros((n_batch, 1)))
 
   def cond(n, *args):
-    """We run the loop until all elements are covered by diagonals.
+    """We run the loop until all input-frames have been consumed.
     """
-    return tf.less(n, num_diagonals)
+    return tf.less(n, num_columns)
 
   def body_forward(n, alpha_ta):
-    """body of the while_loop, loops over the diagonals of the alpha-tensor."""
+    """body of the while_loop, loops over the columns of the alpha-tensor."""
     # alpha(t-1,u-1) + logprobs(t-1, u-1)
     # alpha_blank      + lp_blank
 
-    lp_diagonal = log_probs_ta.read(n-2)[:, :n-1, :]  # (B, U|n, V)
-    lp_diagonal = py_print_iteration_info("lp_diagonal", lp_diagonal, n, debug=debug)
+    lp_column = log_probs_ta.read(n-2)[:, :n-1, :]  # (B, U|n, V)
+    lp_column = py_print_iteration_info("lp_column", lp_column, n, debug=debug)
 
-    diag_maxlen = tf.reduce_min([max_target, n])
-    prev_diagonal = alpha_ta.read(n-1)[:, :diag_maxlen]  # (B, n-1)
-    prev_diagonal = py_print_iteration_info("prev_diagonal", prev_diagonal, n, debug=debug)
+    column_maxlen = tf.reduce_min([max_target, n])
+    prev_column = alpha_ta.read(n-1)[:, :column_maxlen]  # (B, n-1)
+    prev_column = py_print_iteration_info("prev_column", prev_column, n, debug=debug)
 
-    alpha_blank = prev_diagonal  # (B, N)
+    alpha_blank = prev_column  # (B, N)
     alpha_blank = tf.concat([alpha_blank, tf.tile([[tf.constant(NEG_INF)]], [n_batch, 1])], axis=1)
     alpha_blank = py_print_iteration_info("alpha(blank)", alpha_blank, n, debug=debug)
 
     # (B, U, V) -> (B, U)
-    lp_blank = lp_diagonal[:, :, blank_index]  # (B, U)
+    lp_blank = lp_column[:, :, blank_index]  # (B, U)
     lp_blank = tf.concat([lp_blank, tf.tile([[tf.constant(NEG_INF)]], [n_batch, 1])], axis=1)
     lp_blank = py_print_iteration_info("lp(blank)", lp_blank, n, debug=debug)
 
     # (B,N-1) ; (B,1) ->  (B, N)
-    alpha_y = prev_diagonal
+    alpha_y = prev_column
     alpha_y = tf.concat([tf.tile([[tf.constant(NEG_INF)]], [n_batch, 1]), alpha_y], axis=1)
     alpha_y = py_print_iteration_info("alpha(y)", alpha_y, n, debug=debug)
 
@@ -329,7 +286,7 @@ def tf_forward_shifted_rna(log_probs, labels, input_lengths=None, label_lengths=
     )
     lp_y_idxs = tf.stack([batchs, rows, labels_shifted], axis=-1)  # (B, U-1|n-1, 3)
     lp_y_idxs = py_print_iteration_info("lp_y_idxs", lp_y_idxs, n, debug=debug)
-    lp_y = tf.gather_nd(lp_diagonal[:, :, :], lp_y_idxs)  # (B, U)
+    lp_y = tf.gather_nd(lp_column[:, :, :], lp_y_idxs)  # (B, U)
     # (B, U) ; (B, 1) -> (B, U+1)
     lp_y = tf.concat([tf.tile([[tf.constant(NEG_INF)]], [n_batch, 1]), lp_y], axis=1)
     lp_y = py_print_iteration_info("lp(y)", lp_y, n, debug=debug)
@@ -353,11 +310,11 @@ def tf_forward_shifted_rna(log_probs, labels, input_lengths=None, label_lengths=
     y = alpha_y + lp_y
     red_op = tf.stack([blank, y], axis=0)  # (2, B, N)
     red_op = py_print_iteration_info("red-op", red_op, n, debug=debug)
-    new_diagonal = tf.math.reduce_logsumexp(red_op, axis=0)  # (B, N)
+    new_column = tf.math.reduce_logsumexp(red_op, axis=0)  # (B, N)
 
-    new_diagonal = new_diagonal[:, :n]
-    new_diagonal = py_print_iteration_info("new_diagonal", new_diagonal, n, debug=debug)
-    return [n + 1, alpha_ta.write(n, new_diagonal)]
+    new_column = new_column[:, :n]
+    new_column = py_print_iteration_info("new_column", new_column, n, debug=debug)
+    return [n + 1, alpha_ta.write(n, new_column)]
 
   n = tf.constant(2)
   final_n, alpha_out_ta = tf.while_loop(cond, body_forward, [n, alpha_ta],
@@ -367,14 +324,14 @@ def tf_forward_shifted_rna(log_probs, labels, input_lengths=None, label_lengths=
   # p(y|x) = alpha(T,U) * blank(T,U)  (--> in log-space)
   # ll_tf = final_alpha[n_time-1, n_target-1]
 
-  # (B,): batch index -> diagonal index
-  diag_idxs = input_lengths + 1   # (B,)
+  # (B,): batch index -> column index
+  col_idxs = input_lengths + 1   # (B,)
 
-  # (B,): batch index -> index within diagonal
-  within_diag_idx = label_lengths
-  within_diag_idx = tf.where(tf.less_equal(label_lengths, input_lengths),
-      within_diag_idx,  # everything ok, T>U
-      tf.ones_like(within_diag_idx) * -1)  #  U > T, not possible in RNA
+  # (B,): batch index -> index within column
+  within_col_idx = label_lengths
+  within_col_idx = tf.where(tf.less_equal(label_lengths, input_lengths),
+                            within_col_idx,  # everything ok, T>U
+                            tf.ones_like(within_col_idx) * -1)  # U > T, not possible in RNA
 
   res_ta = tf.TensorArray(
     dtype=tf.float32,
@@ -383,16 +340,16 @@ def tf_forward_shifted_rna(log_probs, labels, input_lengths=None, label_lengths=
     dynamic_size=False,
     infer_shape=False,
     element_shape=(),
-    name="alpha_diagonals",
+    name="alpha_columns",
   )
   tf_neg_inf = tf.constant(NEG_INF)
 
   def ta_read_body(i, res_loop_ta):
-    """Reads from the alpha-diagonals TensorArray. We need this because of the inconsistent shapes in the TA."""
-    ta_item = alpha_out_ta.read(diag_idxs[i])[i]
-    elem = tf.cond(tf.equal(within_diag_idx[i], -1), lambda: tf_neg_inf, lambda: ta_item[within_diag_idx[i]])
-    elem = py_print_iteration_info("FINAL", elem, i, "diag_idxs", diag_idxs, "within_diag_idx:", within_diag_idx,
-                                   "diag", ta_item, debug=debug)
+    """Reads from the alpha-columns TensorArray. We need this because of the inconsistent shapes in the TA."""
+    ta_item = alpha_out_ta.read(col_idxs[i])[i]
+    elem = tf.cond(tf.equal(within_col_idx[i], -1), lambda: tf_neg_inf, lambda: ta_item[within_col_idx[i]])
+    elem = py_print_iteration_info("FINAL", elem, i, "col_idxs", col_idxs, "within_col_idx:", within_col_idx,
+                                   "column", ta_item, debug=debug)
     return i+1, res_loop_ta.write(i, elem)
 
   _, ll_ta = tf.while_loop(
