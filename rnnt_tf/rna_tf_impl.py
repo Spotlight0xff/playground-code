@@ -752,6 +752,7 @@ def test_batched():
     test_impl("batched(%d): T=%r, U=%r" % (i, input_lengths, label_lengths), acts, labels, blank_index=0, input_lens=input_lengths,
               label_lens=label_lengths, timing=False)
 
+
 def test_batched_labelrep():
   """Check batched, different output/input lengths.
   """
@@ -811,14 +812,14 @@ if __name__ == '__main__':
 
   np.random.seed(42)
 
+  test_batched()
   test_batched_labelrep()
-  # test_real()
-  # test_batched()
-  # test_batched_tiled()
+  test_real()
+  test_batched_tiled()
   test_small()
   test_small_labelrep()
-  # test_size_t_greater_u()
-  # test_size_t_equal_u()
-  # test_sizes()
-  # test_blank_idx_nonzero()
-  # test_big()
+  test_size_t_greater_u()
+  test_size_t_equal_u()
+  test_sizes()
+  test_blank_idx_nonzero()
+  test_big()
