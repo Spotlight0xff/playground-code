@@ -39,7 +39,7 @@ def log_softmax(acts, axis):
     return log_probs
 
 
-def forward_pass(log_probs, labels, blank):
+def forward_pass(log_probs, labels, blank, label_rep=False):
 
     T, U, _ = log_probs.shape
     S = T-U+2
@@ -57,6 +57,13 @@ def forward_pass(log_probs, labels, blank):
             skip = alphas[t-1, u] + log_probs[t+u-1, u, blank]
             emit = alphas[t, u-1] + log_probs[t+u-1, u-1, labels[u-1]]
             alphas[t, u] = logsumexp(emit, skip)
+            if label_rep:  # merge_repeated in ctc loss
+                # We add the arc which corresponds to a repeated label
+                # i.e.
+                same = alphas[t-1, u, log_probs[t+u-1, u-1, labels[u-1]]]
+                alphas[t, u] = logsumexp(alphas[t, u], same)
+
+
 
     return alphas, alphas[S-1, U-1]
 
