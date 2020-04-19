@@ -54,7 +54,7 @@ def py_print_iteration_info(msg, var, n, *vars, debug=True):
   return var
 
 
-def numpy_forward_naive(log_probs, labels, blank_index, label_rep=False, debug=False):
+def numpy_forward_naive(log_probs, labels, blank_index, label_rep=False, with_alignment=False, debug=False):
   """Forward calculation of the RNA loss."""
   n_time, n_target, n_vocab = log_probs.shape  # (T, U+1, V)
   alpha = np.zeros((n_time+1, n_target))  # 1 in log-space
@@ -63,9 +63,13 @@ def numpy_forward_naive(log_probs, labels, blank_index, label_rep=False, debug=F
   if debug:
     print("labels: ", labels)
     print("U=%d, T=%d, V=%d" % (n_target, n_time, n_vocab))
+  bt_mat = np.ones((n_time+1, n_target), dtype=np.int32) * -9999  # store hat{x_j} of the most likely path so far
+  bt_mat[0, 0] = 0
+
   for t in range(1, n_time+1):
     # blank - blank - blank - ...
     alpha[t, 0] = alpha[t - 1, 0] + log_probs[t - 1, 0, blank_index]
+    bt_mat[t, 0] = 0
     if debug:
       print('t=%2d u= 0: alpha[%d, 0] + log_probs[%d, 0, %d] = %.3f + %.3f = %.3f' % (
         t, t-1, t-1, blank_index, alpha[t - 1, 0], log_probs[t - 1, 0, blank_index], alpha[t, 0]))
@@ -73,6 +77,7 @@ def numpy_forward_naive(log_probs, labels, blank_index, label_rep=False, debug=F
     # label - label - label - ...
     if t < n_target:
       alpha[t, t] = alpha[t-1, t-1] + log_probs[t-1, t-1, labels[t-1]]
+      bt_mat[t, t] = t-1
 
     for u in range(1, min(t, n_target)):
       skip = alpha[t - 1, u] + log_probs[t - 1, u, blank_index]
@@ -82,17 +87,29 @@ def numpy_forward_naive(log_probs, labels, blank_index, label_rep=False, debug=F
       # see figure https://github.com/1ytic/warp-rna/blob/master/aligner.gif
       # we allow the 'd' symbol to be output, from the arc (T=2,U=1) -> (T=3, U=1)
       # but we need to take care to not include the arc for the first output (emit)
-      if label_rep and t-u > 1:  # above the diagonal line
+      if label_rep and t-u > 1:  # enabled and not on the diagonal line
         same = alpha[t-1, u] + log_probs[t-1, u, labels[u-1]]
         if debug:
           print("t=%2d u=%2d same=%.3f a=%.3f lp[%d, %d, labels[%d]]=%3f label=%s" %
                 (t, u, same, alpha[t-1, u], t-1, u, u-1, log_probs[t-1, u, labels[u-1]], labels[u-1]))
         sum_args += [same]
+      max_prob_idx = int(np.argmax(sum_args))
+      # list-idx -> state-idx
+      argmax_dict = {0: u,    # (t-1, u),    # skip
+                     1: u-1,  # (t-1, u-1),  # emit
+                     2: u,    # (t-1, u),    # same
+                     }
+      argmax_state = argmax_dict[max_prob_idx]
+      # if debug:
+      print("[np naive] BT[%2d,%2d] = (%s) %d state=%d" % (t-1, u, {0: "skip", 1: "emit", 2: "same"}[max_prob_idx],
+                                                max_prob_idx, argmax_state))
+      bt_mat[t, u] = argmax_state
+
       alpha[t, u] = elem = logsumexp(*sum_args)  # addition in linear-space -> LSE in log-space
       if debug:
         print('t=%2d u=%2d: LSE(%.3f + %.3f, %.3f +  %.3f) = LSE(%.3f, %.3f) = %.3f' % (t, u,
                                                                                         alpha[t - 1, u],
-                                                                                        log_probs[t - 1, u, blank_index],
+                                                                                        log_probs[t-1, u, blank_index],
                                                                                         alpha[t - 1, u - 1],
                                                                                         log_probs[t - 1, u - 1,
                                                                                                   labels[u - 1]],
@@ -104,20 +121,78 @@ def numpy_forward_naive(log_probs, labels, blank_index, label_rep=False, debug=F
     np.set_printoptions(precision=3, linewidth=120)
     print(alpha)
   nll = - alpha[n_time, n_target-1]
+  np.set_printoptions(precision=3, linewidth=120)
+  print("[np naive] backtrack matrix:")
+  print(bt_mat)
+  alignments = compute_alignment(bt_mat[np.newaxis, ...], np.array([n_time]), np.array([n_target]))
+  alignment = alignments[0]
+  assert len(alignment) == n_time
+  print("[np naive] Alignment:", alignment)
   if debug:
     print("negative log-likelihood = - alpha[%d, %d] = %.4f" %
           (n_time, n_target-1, nll))
-  return alpha, nll
+  if with_alignment:
+    return alpha, nll, alignment
+  else:
+    return alpha, nll
 
 
-def numpy_forward_batched(log_probs, labels, blank_index, input_lens, label_lens, debug=False, label_rep=False):
+def compute_alignment_numpy_batched(bt_mat, input_lens, label_lens):
+  """Computes the alignment from the backtracking matrix.
+  We do this in a batched fashion so we can compare/copy this directly to TF.
+
+  :param bt_mat: backtracking matrix (B, T+1, U)
+  :param input_lens: (B,)
+  :param label_lens: (B,)
+
+  :return alignment of form (B, T) -> [U]
+  :rtype np.ndarray
+  """
+  assert input_lens.shape == label_lens.shape
+  n_batch, max_time, max_target = bt_mat.shape
+  alignments = np.zeros((n_batch, max_time-1), dtype=np.int32)
+  idx = bt_mat[np.arange(n_batch), input_lens, label_lens-1]
+  initial_idx = idx
+  for t in reversed(range(max_time-1)):
+    assert idx.shape == (n_batch,)
+    print("[np batched] t=%2d idx=" % t, idx)
+    alignments[:, t] = np.where(t <= input_lens-1, idx, 0)  # (B,) masked invalid
+    idx = bt_mat[np.arange(n_batch), np.array([t]), idx]  # (B,)
+    idx = np.where(t > input_lens - 1, initial_idx, idx)
+    assert idx.shape == (n_batch,)
+  return alignments
+
+
+def compute_alignment(bt_mat, input_lens, label_lens):
+  """Computes the alignment from the backtracking matrix."""
+  n_batch = input_lens.shape[0]
+  alignments = []
+  assert input_lens.shape == label_lens.shape
+  for i in range(n_batch):
+    print("Computing alignment for BT: (%r), T=%d, U-1=%d" %
+          (bt_mat[i, :input_lens[i]+1, :label_lens[i]].shape, input_lens[i], label_lens[i]-1))
+    idx = bt_mat[i, input_lens[i], label_lens[i]-1]
+    alignment = np.zeros((input_lens[i],), dtype=np.int32)
+    for t in reversed(range(input_lens[i])):
+      alignment[t] = idx
+      print("align [i=%2d, t=%2d] state-idx=%2d" % (i, t, idx))
+      idx = bt_mat[i, t, idx]
+    alignment[0] = idx
+    print("align [i=%2d, t=%2d] state-idx=%2d" % (i, 0, idx))
+    alignments.append(alignment)
+  return alignments
+
+
+def numpy_forward_batched(log_probs, labels, blank_index, input_lens, label_lens, debug=False,
+                          label_rep=False, with_alignment=False):
   """Forward calculation of the RNA loss using the same strategy as the TF impl."""
   n_batch, max_time, max_target, n_vocab = log_probs.shape  # (B, T, U, V)
   assert labels.shape == (n_batch, max_target-1)  # (B, U-1)
-  if debug:
+  if debug or True:
     print("U=%d, T=%d, V=%d" % (max_target-1, max_time, n_vocab))
     print("log-probs: (B=%d, T=%d, U+1=%d, V=%d)" % (n_batch, max_time, max_target, n_vocab))
     print("labels: (B=%d, U-1=%d)" % (n_batch, labels.shape[1]))
+    print("seq-lengths: T=%r U=%r" % (input_lens, label_lens))
 
   def print_debug(n, *vars):
     """Some basic debug information printing."""
@@ -125,6 +200,7 @@ def numpy_forward_batched(log_probs, labels, blank_index, input_lens, label_lens
       print("[n=%2d]" % n, *vars)
   # alpha columns
   alphas = [[], np.zeros((n_batch, 1))]
+  bt_mat = np.zeros((n_batch, max_time+1, max_target), dtype=np.int32)
 
   for n in range(2, max_time+2):
     # actually previous one.
@@ -178,6 +254,7 @@ def numpy_forward_batched(log_probs, labels, blank_index, input_lens, label_lens
     print_debug(n, colored("alpha_y", "red"), alpha_y)
     y = alpha_y + lp_y
     print_debug(n, colored("y", "red"), y)
+    sum_args = [blank, y]
 
     new_column = np.logaddexp(blank, y)  # (B, N)
 
@@ -215,9 +292,19 @@ def numpy_forward_batched(log_probs, labels, blank_index, input_lens, label_lens
         lp_same = lp_same[:, :cut_off]
       print_debug(n, colored("lp_same", "yellow"), lp_same)
       same = alpha_same + lp_same
+      sum_args += [same]
       new_column = np.logaddexp(new_column, same)
 
-    # new_column = new_column[:, :n]
+    # sum_args: (3|2, B, N)
+    argmax_idx = np.argmax(sum_args, axis=0)  # (B, N) -> [2|3]
+    max_len = sum_args[0].shape[1]  # np.minimum(n-1, max_target)
+    u_ranged = np.expand_dims(np.arange(max_len), axis=0)  # (1, U|n)
+    u_ranged_shifted = u_ranged - 1
+    # we track the state where the arc came from:
+    # bt_mat: (B, T, U)           blank           emit           same
+    sel = np.where(np.logical_or(argmax_idx == 0, argmax_idx == 2), u_ranged, u_ranged_shifted)
+    bt_mat[:, n-1, :max_len] = sel
+
     print_debug(n, "new_column", new_column)
     alphas.append(new_column)  # s.t. alphas[n] == new_column
 
@@ -226,6 +313,26 @@ def numpy_forward_batched(log_probs, labels, blank_index, input_lens, label_lens
 
   list_nll = []
   col_idxs = input_lens + 1  # (B,)
+  print("[np batched] T=%r U=%r" % (input_lens, label_lens))
+  print(bt_mat[0])
+
+  # backtracking
+  alignments = compute_alignment(bt_mat, input_lens, label_lens+1)
+  alignments_np = compute_alignment_numpy_batched(bt_mat, input_lens, label_lens+1)
+  assert len(alignments) == alignments_np.shape[0]
+  print("[np batched] alignments:")
+  print(alignments_np)
+  print("[np batched] naive alignments:")
+  print("\n".join(map(str, alignments)))
+
+  for i in range(n_batch):
+    np.testing.assert_allclose(alignments[i], alignments_np[i][:input_lens[i]])
+  print("[np batched] Alignment:", alignments[0])
+  print("[np batched] Alignment:", alignments_np[0])
+  # assert alignment.shape == (n_batch, max_time+1)
+  # if debug:
+  # print("Alignments:")
+  # print(alignment)
 
   # (B,): batch index -> index within column
   # We need to handle the U>T case for each example.
@@ -240,7 +347,10 @@ def numpy_forward_batched(log_probs, labels, blank_index, input_lens, label_lens
       print("FINAL i=%d" % i, "NLL=%.3f" % (-a))
     nll = -a  # + b
     list_nll.append(nll)
-  return np.array(list_nll)  # (B,)
+  if with_alignment:
+    return np.array(list_nll), alignments  # (B,)
+  else:
+    return np.array(list_nll)  # (B,)
 
 
 def tf_forward_shifted_rna(log_probs, labels, input_lengths=None, label_lengths=None, blank_index=0,
@@ -451,7 +561,7 @@ def tf_forward_shifted_rna(log_probs, labels, input_lengths=None, label_lengths=
 
 
 def test_impl(name, acts, labels, blank_index, input_lens=None, label_lens=None,
-              timing=False, debug=False, log_probs=None, label_rep=False):
+              timing=False, debug=False, log_probs=None, label_rep=False, with_alignment=True):
   """
   runs the different implementations on the same data, comparing them.
 
@@ -511,9 +621,12 @@ def test_impl(name, acts, labels, blank_index, input_lens=None, label_lens=None,
   list_grads = []
   list_alphas = []
   list_cost_naive = []
+  list_alignments = []
   for i in range(n_batch):
     log_probs_i = log_probs[i, :input_lens[i], :label_lens[i]+1, :]
+    print(labels)
     labels_i = labels[i, :label_lens[i]]
+    print(labels_i)
     input_len = input_lens[i]
     assert log_probs_i.shape == (input_len, labels_i.shape[0] + 1, n_vocab)
     alphas, ll_forward = forward_pass(log_probs_i, labels_i, blank_index)
@@ -534,8 +647,14 @@ def test_impl(name, acts, labels, blank_index, input_lens=None, label_lens=None,
     list_alphas.append(alphas)
     list_grads.append(analytical_grads)
 
-    alpha_np_naive, cost_np_naive = numpy_forward_naive(log_probs_i, labels_i, blank_index, label_rep=label_rep,
-                                                        debug=debug)
+    res = numpy_forward_naive(log_probs_i, labels_i, blank_index,
+                              label_rep=label_rep, with_alignment=with_alignment,
+                              debug=debug)
+    if with_alignment:
+      alpha_np_naive, cost_np_naive, alignment_naive = res
+      list_alignments += [alignment_naive]
+    else:
+      alpha_np_naive, cost_np_naive = res
     if not label_rep:
       np.testing.assert_almost_equal(cost_np_naive, -ll_forward, decimal=5, err_msg="costs(numpy) != costs(ref)")
     list_cost_naive += [cost_np_naive]
@@ -547,9 +666,20 @@ def test_impl(name, acts, labels, blank_index, input_lens=None, label_lens=None,
   else:
     print_results("Reference", costs_ref, list_grads)
 
-  costs_np = numpy_forward_batched(log_probs, labels, blank_index=blank_index,
-                                   input_lens=input_lens, label_lens=label_lens,
-                                   label_rep=label_rep, debug=debug)
+  res_np = numpy_forward_batched(log_probs, labels, blank_index=blank_index,
+                                 input_lens=input_lens, label_lens=label_lens,
+                                 label_rep=label_rep, with_alignment=with_alignment,
+                                 debug=debug)
+  if with_alignment:
+    costs_np, alignments_np = res_np
+    print("[np batched] alignments:")
+    print(alignments_np)
+    for i in range(n_batch):
+      np.testing.assert_allclose(alignments_np[i][:input_lens[i]], list_alignments[i])
+      print("Numpy batched vs Numpy naive: alignment ", colored("MATCH", "green"))
+  else:
+    costs_np = res_np
+
   print_results("NumPy batched", costs_np, None)
   if label_rep:
     np.testing.assert_almost_equal(costs_np, list_cost_naive, decimal=5,
@@ -645,7 +775,7 @@ def test_small():
   output_len = 4
   acts = np.random.rand(input_len, output_len, vocab_size)
   labels = np.array([1, 2, 3])
-  test_impl("test_small", acts, labels, blank_index)
+  test_impl("test_small", acts, labels, blank_index, with_alignment=True)
 
 
 def test_small_labelrep():
@@ -745,12 +875,13 @@ def test_batched():
   n_target = 7
   n_vocab = 5
   acts = np.random.standard_normal((n_batch, n_time, n_target, n_vocab))
-  for i in range(8):
+  for i in [3]: #range(8):
     label_lengths = np.random.randint(1, n_target, (n_batch,))  # [1, U)
-    input_lengths = label_lengths + np.random.randint(0, n_time-n_target, (n_batch,))
+    #input_lengths = label_lengths + np.random.randint(0, n_time-n_target, (n_batch,))
+    input_lengths = label_lengths + np.random.randint(1, n_time - n_target, (n_batch,))
     labels = np.random.randint(1, n_vocab-1, (n_batch, n_target-1,))  # except blank=0
     test_impl("batched(%d): T=%r, U=%r" % (i, input_lengths, label_lengths), acts, labels, blank_index=0, input_lens=input_lengths,
-              label_lens=label_lengths, timing=False)
+              label_lens=label_lengths, timing=False, with_alignment=True, debug=False)
 
 
 def test_batched_labelrep():
@@ -804,6 +935,20 @@ def test_big():
   test_impl("test_big", acts, labels, blank_index, timing=True)
 
 
+def run_all_tests():
+  test_batched()
+  # test_batched_labelrep()
+  # test_real()
+  # test_batched_tiled()
+  # test_small()
+  # test_small_labelrep()
+  # test_size_t_greater_u()
+  # test_size_t_equal_u()
+  # test_sizes()
+  # test_blank_idx_nonzero()
+  # test_big()
+
+
 if __name__ == '__main__':
   tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.ERROR)
   sess = tf.Session()
@@ -812,14 +957,4 @@ if __name__ == '__main__':
 
   np.random.seed(42)
 
-  test_batched()
-  test_batched_labelrep()
-  test_real()
-  test_batched_tiled()
-  test_small()
-  test_small_labelrep()
-  test_size_t_greater_u()
-  test_size_t_equal_u()
-  test_sizes()
-  test_blank_idx_nonzero()
-  test_big()
+  run_all_tests()
