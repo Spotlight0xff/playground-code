@@ -63,13 +63,15 @@ def numpy_forward_naive(log_probs, labels, blank_index, label_rep=False, with_al
   if debug:
     print("labels: ", labels)
     print("U=%d, T=%d, V=%d" % (n_target, n_time, n_vocab))
-  bt_mat = np.ones((n_time+1, n_target), dtype=np.int32) * -9999  # store hat{x_j} of the most likely path so far
+  bt_mat = np.zeros((n_time+1, n_target), dtype=np.int32)  # store hat{x_j} of the most likely path so far
+  bt_mat_score = np.zeros((n_time + 1, n_target), dtype=np.int32)  # store hat{x_j} of the most likely path so far
   bt_mat[0, 0] = 0
 
   for t in range(1, n_time+1):
     # blank - blank - blank - ...
     alpha[t, 0] = alpha[t - 1, 0] + log_probs[t - 1, 0, blank_index]
     bt_mat[t, 0] = 0
+    bt_mat_score[t, 0] = log_probs[t - 1, 0, blank_index]
     if debug:
       print('t=%2d u= 0: alpha[%d, 0] + log_probs[%d, 0, %d] = %.3f + %.3f = %.3f' % (
         t, t-1, t-1, blank_index, alpha[t - 1, 0], log_probs[t - 1, 0, blank_index], alpha[t, 0]))
@@ -78,6 +80,7 @@ def numpy_forward_naive(log_probs, labels, blank_index, label_rep=False, with_al
     if t < n_target:
       alpha[t, t] = alpha[t-1, t-1] + log_probs[t-1, t-1, labels[t-1]]
       bt_mat[t, t] = t-1
+      bt_mat_score[t, t] = log_probs[t-1, t-1, labels[t-1]]
 
     for u in range(1, min(t, n_target)):
       skip = alpha[t - 1, u] + log_probs[t - 1, u, blank_index]
@@ -104,6 +107,9 @@ def numpy_forward_naive(log_probs, labels, blank_index, label_rep=False, with_al
       print("[np naive] BT[%2d,%2d] = (%s) %d state=%d" % (t-1, u, {0: "skip", 1: "emit", 2: "same"}[max_prob_idx],
                                                 max_prob_idx, argmax_state))
       bt_mat[t, u] = argmax_state
+      bt_mat_score[t, u] = {0: log_probs[t - 1, u, blank_index],
+                            1: log_probs[t - 1, u - 1, labels[u - 1]],
+                            2: log_probs[t-1, u, labels[u-1]]}.get(max_prob_idx)
 
       alpha[t, u] = elem = logsumexp(*sum_args)  # addition in linear-space -> LSE in log-space
       if debug:
@@ -161,6 +167,56 @@ def compute_alignment_numpy_batched(bt_mat, input_lens, label_lens):
     idx = np.where(t > input_lens - 1, initial_idx, idx)
     assert idx.shape == (n_batch,)
   return alignments
+
+
+def compute_alignment_tf(bt_mat, input_lens, label_lens):
+  """Computes the alignment from the backtracking matrix.
+  We do this in a batched fashion so we can compare/copy this directly to TF.
+
+  :param bt_mat: backtracking matrix (B, T+1, U)
+  :param input_lens: (B,)
+  :param label_lens: (B,)
+
+  :return alignment of form (B, T) -> [U]
+  :rtype np.ndarray
+  """
+  shape = tf.shape(bt_mat)
+  n_batch, max_time, max_target = shape[0], shape[1], shape[2]
+  alignments = tf.TensorArray(
+    dtype=tf.int32,
+    clear_after_read=False,
+    size=max_time-1,
+    dynamic_size=False,
+    infer_shape=False,
+    element_shape=(None,),  # (B,)
+    name="alignments",
+  )
+
+  idxs = tf.stack([
+    tf.range(n_batch),
+    input_lens,
+    label_lens-1
+  ], axis=-1)  # (B, 3)
+  initial_idx = tf.gather_nd(bt_mat, idxs)
+
+  def body(t, alignments, idx):
+    t = py_print_iteration_info("align", t, t, "t=", t, "idx=", idx)
+    alignments = alignments.write(t, tf.where(tf.less_equal(t, input_lens-1), idx, tf.zeros_like(idx)))  # (B,)
+    idxs = tf.stack([
+      tf.range(n_batch),  # (B,1)
+      tf.tile([t], [n_batch]),  # (1,)
+      idx,  # (B,)
+    ], axis=-1)
+    idx = tf.gather_nd(bt_mat, idxs)
+    idx = py_print_iteration_info("idx", idx, t, "idx=", idx)
+    idx = tf.where(tf.greater(t, input_lens - 1), initial_idx, idx)
+    return t-1, alignments, idx
+  t = max_time-2
+  final_t, final_alignments, final_idx = tf.while_loop(lambda t, idx, _: tf.greater(t, 0),
+                                                       body,
+                                                       (t, alignments, initial_idx))
+  final_alignments = final_alignments.write(0, final_idx)
+  return tf.transpose(final_alignments.stack())  # (T, B) -> (B, T)
 
 
 def compute_alignment(bt_mat, input_lens, label_lens):
@@ -317,22 +373,7 @@ def numpy_forward_batched(log_probs, labels, blank_index, input_lens, label_lens
   print(bt_mat[0])
 
   # backtracking
-  alignments = compute_alignment(bt_mat, input_lens, label_lens+1)
   alignments_np = compute_alignment_numpy_batched(bt_mat, input_lens, label_lens+1)
-  assert len(alignments) == alignments_np.shape[0]
-  print("[np batched] alignments:")
-  print(alignments_np)
-  print("[np batched] naive alignments:")
-  print("\n".join(map(str, alignments)))
-
-  for i in range(n_batch):
-    np.testing.assert_allclose(alignments[i], alignments_np[i][:input_lens[i]])
-  print("[np batched] Alignment:", alignments[0])
-  print("[np batched] Alignment:", alignments_np[0])
-  # assert alignment.shape == (n_batch, max_time+1)
-  # if debug:
-  # print("Alignments:")
-  # print(alignment)
 
   # (B,): batch index -> index within column
   # We need to handle the U>T case for each example.
@@ -348,13 +389,13 @@ def numpy_forward_batched(log_probs, labels, blank_index, input_lens, label_lens
     nll = -a  # + b
     list_nll.append(nll)
   if with_alignment:
-    return np.array(list_nll), alignments  # (B,)
+    return np.array(list_nll), alignments_np  # (B,)
   else:
     return np.array(list_nll)  # (B,)
 
 
 def tf_forward_shifted_rna(log_probs, labels, input_lengths=None, label_lengths=None, blank_index=0,
-                           label_rep=False, debug=False):
+                           label_rep=False, with_alignment=False, debug=False):
   """
   Computes the batched forward pass of the RNA model.
   B: batch, T: time, U:target/labels, V: vocabulary
@@ -364,10 +405,10 @@ def tf_forward_shifted_rna(log_probs, labels, input_lengths=None, label_lengths=
   :param tf.Tensor input_lengths: (B,) length of input frames
   :param tf.Tensor label_lengths: (B,) length of labels
   :param int blank_index: index of the blank symbol in the vocabulary
+  :param bool with_alignment: Also computes and returns the best-path alignment
   :param bool debug: enable verbose logging
   :return:
   """
-  """Pure TF implementation of the RNA loss."""
   shape = tf.shape(log_probs)
   n_batch = shape[0]     # B
   max_time = shape[1]    # T
@@ -400,12 +441,26 @@ def tf_forward_shifted_rna(log_probs, labels, input_lengths=None, label_lengths=
   )
   alpha_ta = alpha_ta.write(1, tf.zeros((n_batch, 1)))
 
+  if with_alignment:
+    bt_ta = tf.TensorArray(
+      dtype=tf.int32,
+      clear_after_read=False,
+      size=num_columns-1,
+      dynamic_size=False,
+      infer_shape=True,
+      element_shape=(None, None,),  # (B, U)
+      name="bt_columns",
+    )  # (T, B, U)
+    bt_ta = bt_ta.write(0, tf.zeros((n_batch, max_target), dtype=tf.int32))
+  else:
+    bt_ta = None
+
   def cond(n, *args):
     """We run the loop until all input-frames have been consumed.
     """
     return tf.less(n, num_columns)
 
-  def body_forward(n, alpha_ta):
+  def body_forward(n, alpha_ta, *args):
     """body of the while_loop, loops over the columns of the alpha-tensor."""
     # alpha(t-1,u-1) + logprobs(t-1, u-1)
     # alpha_blank      + lp_blank
@@ -509,19 +564,47 @@ def tf_forward_shifted_rna(log_probs, labels, input_lengths=None, label_lengths=
                      lambda: tf.ones_like(y) * NEG_INF)
       reduction_args += [same]
 
+    # We can compute the most probable path
+    if with_alignment:
+      bt_ta = args[0]
+      # reduction_args: (3|2, B, N)
+      argmax_idx = tf.argmax(reduction_args, axis=0)  # (B, N) -> [2|3]
+      max_len = tf.shape(reduction_args[0])[1]
+      u_ranged = tf.tile(tf.expand_dims(tf.range(max_len), axis=0), [n_batch, 1])  # (1, U|n)
+      u_ranged_shifted = u_ranged - 1
+      # we track the state where the arc came from:
+      # bt_mat: (B, T, U)           blank (u)           emit (u-1)           same (u)
+      sel = tf.where(tf.logical_or(tf.equal(argmax_idx, 0), tf.equal(argmax_idx, 2)),
+                     u_ranged, u_ranged_shifted)  # (B, U|n)
+      # we need to pad so we can stack the TA later on (instead of triangular shape)
+      sel_padded = tf.pad(sel, [[0, 0], [0, max_target - max_len]])
+      bt_ta = bt_ta.write(n-1, sel_padded)
+    else:
+      bt_ta = None
+
     red_op = tf.stack(reduction_args, axis=0)  # (2, B, N)
     red_op = py_print_iteration_info("red-op", red_op, n, debug=debug)
     new_column = tf.math.reduce_logsumexp(red_op, axis=0)  # (B, N)
 
     new_column = new_column[:, :n]
     new_column = py_print_iteration_info("new_column", new_column, n, debug=debug)
-    return [n + 1, alpha_ta.write(n, new_column)]
+    ret_args = [n + 1, alpha_ta.write(n, new_column)]
+    return ret_args + [bt_ta] if with_alignment else ret_args
 
   n = tf.constant(2)
-  final_n, alpha_out_ta = tf.while_loop(cond, body_forward, [n, alpha_ta],
-                                        parallel_iterations=1,  # need this due to the iterative computation using TAs
-                                        name="rna_loss")
-
+  initial_vars = [n, alpha_ta]
+  if with_alignment:
+    initial_vars += [bt_ta]
+  final_loop_vars = tf.while_loop(cond, body_forward,
+                                  initial_vars,
+                                  parallel_iterations=1,  # iterative computation
+                                  name="rna_loss")
+  if with_alignment:
+    final_n, alpha_out_ta, bt_ta = final_loop_vars
+    bt_mat = tf.transpose(bt_ta.stack(), [1, 0, 2])  # (T, B, U) -> (B, T, U)
+    alignments = compute_alignment_tf(bt_mat, input_lengths, label_lengths+1)
+  else:
+    final_n, alpha_out_ta = final_loop_vars
   # p(y|x) = alpha(T,U) * blank(T,U)  (--> in log-space)
   # ll_tf = final_alpha[n_time-1, n_target-1]
 
@@ -557,7 +640,10 @@ def tf_forward_shifted_rna(log_probs, labels, input_lengths=None, label_lengths=
     lambda i, res_ta: i < n_batch,
     ta_read_body, (tf.constant(0, tf.int32), res_ta)
   )
-  return ll_ta.stack()
+  if with_alignment:
+    return ll_ta.stack(), alignments
+  else:
+    return ll_ta.stack()
 
 
 def test_impl(name, acts, labels, blank_index, input_lens=None, label_lens=None,
@@ -672,11 +758,11 @@ def test_impl(name, acts, labels, blank_index, input_lens=None, label_lens=None,
                                  debug=debug)
   if with_alignment:
     costs_np, alignments_np = res_np
-    print("[np batched] alignments:")
-    print(alignments_np)
+    if debug:
+      print("[np batched] alignments:")
+      print(alignments_np)
     for i in range(n_batch):
       np.testing.assert_allclose(alignments_np[i][:input_lens[i]], list_alignments[i])
-      print("Numpy batched vs Numpy naive: alignment ", colored("MATCH", "green"))
   else:
     costs_np = res_np
 
@@ -698,19 +784,24 @@ def test_impl(name, acts, labels, blank_index, input_lens=None, label_lens=None,
       run_metadata = tf.RunMetadata()
       tf_run_opts = {'options': run_options, 'run_metadata': run_metadata}
     with tf.device("/cpu:0"):  # run on CPU, so that TF doesn't hog the GPU
-      costs_ph = tf_forward_shifted_rna(log_probs_ph, labels_ph,
-                                        input_lengths=input_lengths_ph,
-                                        label_lengths=label_lengths_ph,
-                                        blank_index=blank_index,
-                                        label_rep=label_rep, debug=debug)
+      ret_ph = tf_forward_shifted_rna(log_probs_ph, labels_ph,
+                                      input_lengths=input_lengths_ph,
+                                      label_lengths=label_lengths_ph,
+                                      blank_index=blank_index,
+                                      label_rep=label_rep, with_alignment=with_alignment,
+                                      debug=debug)
+      if with_alignment:
+        costs_ph, alignments_ph = ret_ph
+      else:
+        costs_ph = ret_ph
       grads_ph = tf.gradients(xs=log_probs_ph, ys=[-costs_ph])
     assert len(grads_ph) == 1
     grads_ph = grads_ph[0]
-    ll_tf, grads_tf = sess.run([costs_ph, grads_ph],
-                               feed_dict={log_probs_ph: log_probs,
-                                          labels_ph: labels,
-                                          input_lengths_ph: input_lens,
-                                          label_lengths_ph: label_lens}, **tf_run_opts)
+    ll_tf, grads_tf, alignments_tf = sess.run([costs_ph, grads_ph] + ([alignments_ph] if with_alignment else [None]),
+                                              feed_dict={log_probs_ph: log_probs,
+                                                         labels_ph: labels,
+                                                         input_lengths_ph: input_lens,
+                                                         label_lengths_ph: label_lens}, **tf_run_opts)
     if timing:
       max_bytes = sess.run(tf.contrib.memory_stats.MaxBytesInUse())
       print("max bytes in use:", max_bytes)
@@ -721,6 +812,9 @@ def test_impl(name, acts, labels, blank_index, input_lens=None, label_lens=None,
         f.write(ctf)
     nll_tf = -ll_tf
   print_results("Tensorflow", nll_tf, grads_tf)
+
+  if with_alignment:
+    np.testing.assert_equal(alignments_tf, alignments_np)
 
   assert np.isfinite(grads_tf).all(), "Found non-finite values in TF gradients."
   # Do all the tests (ref vs TF), for score, and grads
@@ -877,7 +971,6 @@ def test_batched():
   acts = np.random.standard_normal((n_batch, n_time, n_target, n_vocab))
   for i in [3]: #range(8):
     label_lengths = np.random.randint(1, n_target, (n_batch,))  # [1, U)
-    #input_lengths = label_lengths + np.random.randint(0, n_time-n_target, (n_batch,))
     input_lengths = label_lengths + np.random.randint(1, n_time - n_target, (n_batch,))
     labels = np.random.randint(1, n_vocab-1, (n_batch, n_target-1,))  # except blank=0
     test_impl("batched(%d): T=%r, U=%r" % (i, input_lengths, label_lengths), acts, labels, blank_index=0, input_lens=input_lengths,
@@ -937,16 +1030,16 @@ def test_big():
 
 def run_all_tests():
   test_batched()
-  # test_batched_labelrep()
-  # test_real()
-  # test_batched_tiled()
-  # test_small()
-  # test_small_labelrep()
-  # test_size_t_greater_u()
-  # test_size_t_equal_u()
-  # test_sizes()
-  # test_blank_idx_nonzero()
-  # test_big()
+  test_batched_labelrep()
+  test_real()
+  test_batched_tiled()
+  test_small()
+  test_small_labelrep()
+  test_size_t_greater_u()
+  test_size_t_equal_u()
+  test_sizes()
+  test_blank_idx_nonzero()
+  test_big()
 
 
 if __name__ == '__main__':
