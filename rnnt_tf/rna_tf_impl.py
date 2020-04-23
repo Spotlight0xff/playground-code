@@ -200,7 +200,6 @@ def compute_alignment_tf(bt_mat, input_lens, label_lens):
   initial_idx = tf.gather_nd(bt_mat, idxs)
 
   def body(t, alignments, idx):
-    t = py_print_iteration_info("align", t, t, "t=", t, "idx=", idx)
     alignments = alignments.write(t, tf.where(tf.less_equal(t, input_lens-1), idx, tf.zeros_like(idx)))  # (B,)
     idxs = tf.stack([
       tf.range(n_batch),  # (B,1)
@@ -208,7 +207,6 @@ def compute_alignment_tf(bt_mat, input_lens, label_lens):
       idx,  # (B,)
     ], axis=-1)
     idx = tf.gather_nd(bt_mat, idxs)
-    idx = py_print_iteration_info("idx", idx, t, "idx=", idx)
     idx = tf.where(tf.greater(t, input_lens - 1), initial_idx, idx)
     return t-1, alignments, idx
   t = max_time-2
