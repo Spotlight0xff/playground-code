@@ -63,15 +63,18 @@ def numpy_forward_naive(log_probs, labels, blank_index, label_rep=False, with_al
   if debug:
     print("labels: ", labels)
     print("U=%d, T=%d, V=%d" % (n_target, n_time, n_vocab))
-  bt_mat = np.zeros((n_time+1, n_target), dtype=np.int32)  # store hat{x_j} of the most likely path so far
-  bt_mat_score = np.zeros((n_time + 1, n_target), dtype=np.int32)  # store hat{x_j} of the most likely path so far
-  bt_mat[0, 0] = 0
+  bt_mat = np.ones((n_time+1, n_target+1, 2), dtype=np.int32) * 0  # store hat{x_j} of the most likely path so far
+  # bt_label =
+  # bt_mat_label = np.zeros((n_time + 1, n_target), dtype=np.int32)  # store hat{y_j} of the current most likely path
+  # blank_state = max(n_target - 1, n_time)  # so that it is definitely last
+  # blank_state = n_target - 1
+  blank_state = 0
+  bt_mat[0, 0] = (0, 0)
 
   for t in range(1, n_time+1):
     # blank - blank - blank - ...
     alpha[t, 0] = alpha[t - 1, 0] + log_probs[t - 1, 0, blank_index]
-    bt_mat[t, 0] = 0
-    bt_mat_score[t, 0] = log_probs[t - 1, 0, blank_index]
+    bt_mat[t, 0] = (0, blank_index)
     if debug:
       print('t=%2d u= 0: alpha[%d, 0] + log_probs[%d, 0, %d] = %.3f + %.3f = %.3f' % (
         t, t-1, t-1, blank_index, alpha[t - 1, 0], log_probs[t - 1, 0, blank_index], alpha[t, 0]))
@@ -79,8 +82,9 @@ def numpy_forward_naive(log_probs, labels, blank_index, label_rep=False, with_al
     # label - label - label - ...
     if t < n_target:
       alpha[t, t] = alpha[t-1, t-1] + log_probs[t-1, t-1, labels[t-1]]
-      bt_mat[t, t] = t-1
-      bt_mat_score[t, t] = log_probs[t-1, t-1, labels[t-1]]
+      bt_mat[t, t] = (t-1, labels[t-1])
+      # bt_mat_label[t-1, t-1] = labels[t-1]
+      # bt_mat_score[t, t] = log_probs[t-1, t-1, labels[t-1]]
 
     for u in range(1, min(t, n_target)):
       skip = alpha[t - 1, u] + log_probs[t - 1, u, blank_index]
@@ -98,18 +102,16 @@ def numpy_forward_naive(log_probs, labels, blank_index, label_rep=False, with_al
         sum_args += [same]
       max_prob_idx = int(np.argmax(sum_args))
       # list-idx -> state-idx
-      argmax_dict = {0: u,    # (t-1, u),    # skip
-                     1: u-1,  # (t-1, u-1),  # emit
-                     2: u,    # (t-1, u),    # same
+      argmax_dict = {0: (u, blank_index),  # skip, blank symbol.
+                     1: (u-1, labels[u-1]),  # (t-1, u-1),  # emit
+                     2: (u, labels[u-1]),    # (t-1, u),    # same
                      }
-      argmax_state = argmax_dict[max_prob_idx]
-      # if debug:
-      print("[np naive] BT[%2d,%2d] = (%s) %d state=%d" % (t-1, u, {0: "skip", 1: "emit", 2: "same"}[max_prob_idx],
-                                                max_prob_idx, argmax_state))
-      bt_mat[t, u] = argmax_state
-      bt_mat_score[t, u] = {0: log_probs[t - 1, u, blank_index],
-                            1: log_probs[t - 1, u - 1, labels[u - 1]],
-                            2: log_probs[t-1, u, labels[u-1]]}.get(max_prob_idx)
+      argmax_tuple = argmax_dict[max_prob_idx]
+      if debug or True:
+        print("[np naive] BT[%2d,%2d] = (%s) %d state=%d, label=%d" % (
+          t - 1, u, {0: "skip", 1: "emit", 2: "same"}[max_prob_idx],
+          max_prob_idx, argmax_tuple[0], argmax_tuple[1]))
+      bt_mat[t, u] = argmax_tuple
 
       alpha[t, u] = elem = logsumexp(*sum_args)  # addition in linear-space -> LSE in log-space
       if debug:
@@ -128,12 +130,21 @@ def numpy_forward_naive(log_probs, labels, blank_index, label_rep=False, with_al
     print(alpha)
   nll = - alpha[n_time, n_target-1]
   np.set_printoptions(precision=3, linewidth=120)
-  print("[np naive] backtrack matrix:")
-  print(bt_mat)
-  alignments = compute_alignment(bt_mat[np.newaxis, ...], np.array([n_time]), np.array([n_target]))
-  alignment = alignments[0]
+  # print("[np naive] backtrack matrix:")
+  # print(bt_mat)
+  # print("[np naive] backtrack matrix labels:")
+  # print(bt_mat_label)
+  alignment = compute_alignment(bt_mat, n_time, n_target)
+  alignment_batched = compute_alignment_numpy_batched(bt_mat[np.newaxis, ...],
+                                                      np.array([n_time]), np.array([n_target]))
+  print("[np naive] batched alignment:", alignment_batched[0])
+  with sess.as_default():
+    align = compute_alignment_tf(tf.expand_dims(bt_mat, axis=0),
+                                 tf.constant([n_time]), tf.constant([n_target]))
+    align_tf = align.eval()
+    print("[np naive] TF alignment:", align_tf[0])
+    np.testing.assert_equal(align_tf, alignment_batched)
   assert len(alignment) == n_time
-  print("[np naive] Alignment:", alignment)
   if debug:
     print("negative log-likelihood = - alpha[%d, %d] = %.4f" %
           (n_time, n_target-1, nll))
@@ -147,41 +158,52 @@ def compute_alignment_numpy_batched(bt_mat, input_lens, label_lens):
   """Computes the alignment from the backtracking matrix.
   We do this in a batched fashion so we can compare/copy this directly to TF.
 
-  :param bt_mat: backtracking matrix (B, T+1, U)
+  :param bt_mat: backtracking matrix (B, T+1, U, 2)
   :param input_lens: (B,)
   :param label_lens: (B,)
 
-  :return alignment of form (B, T) -> [U]
+  :return alignment of form (B, T) -> [V]
   :rtype np.ndarray
   """
   assert input_lens.shape == label_lens.shape
-  n_batch, max_time, max_target = bt_mat.shape
+  n_batch, max_time, max_target, track_dim = bt_mat.shape
+  assert track_dim == 2
+  # blank_state = max_target - 1
+  # (B, U) -> (B, U+1), add blank last state (such that we can do labels[idx])
+  # labels = np.concatenate([labels, np.tile([[blank_index]], [n_batch])], axis=1)
+  # labels = np.concatenate([np.tile([[blank_index]], [n_batch]), labels], axis=1)
   alignments = np.zeros((n_batch, max_time-1), dtype=np.int32)
+  label_align = np.zeros_like(alignments)
   idx = bt_mat[np.arange(n_batch), input_lens, label_lens-1]
   initial_idx = idx
   for t in reversed(range(max_time-1)):
-    assert idx.shape == (n_batch,)
+    assert idx.shape == (n_batch, 2)
     print("[np batched] t=%2d idx=" % t, idx)
-    alignments[:, t] = np.where(t <= input_lens-1, idx, 0)  # (B,) masked invalid
-    idx = bt_mat[np.arange(n_batch), np.array([t]), idx]  # (B,)
-    idx = np.where(t > input_lens - 1, initial_idx, idx)
-    assert idx.shape == (n_batch,)
-  return alignments
+    alignments[:, t] = np.where(t <= input_lens - 1, idx[:, 0], 0)  # (B,) masked invalid
+    label_align[:, t] = np.where(t <= input_lens - 1, idx[:, 1], 0)  # (B,) masked invalid
+    idx = bt_mat[np.arange(n_batch), np.array([t]), idx[:, 0]]  # (B,)
+    cond = (t > input_lens - 1)[:, np.newaxis]
+    idx = np.where(cond, initial_idx, idx)
+    assert idx.shape == (n_batch, 2)
+  # print(label_align)
+  # return alignments
+  return label_align
 
 
 def compute_alignment_tf(bt_mat, input_lens, label_lens):
   """Computes the alignment from the backtracking matrix.
   We do this in a batched fashion so we can compare/copy this directly to TF.
 
-  :param bt_mat: backtracking matrix (B, T+1, U)
+  :param bt_mat: backtracking matrix (B, T+1, U, 2) where (2,) is (state-idx, label-idx)
   :param input_lens: (B,)
   :param label_lens: (B,)
 
-  :return alignment of form (B, T) -> [U]
+  :return alignment of form (B, T) -> [V]
   :rtype np.ndarray
   """
   shape = tf.shape(bt_mat)
   n_batch, max_time, max_target = shape[0], shape[1], shape[2]
+
   alignments = tf.TensorArray(
     dtype=tf.int32,
     clear_after_read=False,
@@ -192,49 +214,79 @@ def compute_alignment_tf(bt_mat, input_lens, label_lens):
     name="alignments",
   )
 
+  # (T, B) TA which holds the max-prob label sequence
+  # this can prob be implemented more efficiently.
+  label_align = tf.TensorArray(
+    dtype=tf.int32,
+    clear_after_read=False,
+    size=max_time-1,
+    dynamic_size=False,
+    infer_shape=True,
+    element_shape=(None,),  # (B,)
+    name="label_align",
+  )
+
   idxs = tf.stack([
     tf.range(n_batch),
     input_lens,
     label_lens-1
   ], axis=-1)  # (B, 3)
-  initial_idx = tf.gather_nd(bt_mat, idxs)
+  initial_idx = tf.gather_nd(bt_mat, idxs)  # (B, 2)
 
-  def body(t, alignments, idx):
-    alignments = alignments.write(t, tf.where(tf.less_equal(t, input_lens-1), idx, tf.zeros_like(idx)))  # (B,)
+  def body(t, alignments, label_align, idx):
+    # backtracking state sequence
+    alignments = alignments.write(t, tf.where(tf.less_equal(t, input_lens-1), idx[:, 0], tf.zeros_like(idx[:, 0])))  # (B,)
+    label_align = label_align.write(t, tf.where(tf.less_equal(t, input_lens-1), idx[:, 1], tf.zeros_like(idx[:, 1])))
     idxs = tf.stack([
       tf.range(n_batch),  # (B,1)
       tf.tile([t], [n_batch]),  # (1,)
-      idx,  # (B,)
+      idx[:, 0],  # (B,)
     ], axis=-1)
     idx = tf.gather_nd(bt_mat, idxs)
     idx = tf.where(tf.greater(t, input_lens - 1), initial_idx, idx)
-    return t-1, alignments, idx
+    return t-1, alignments, label_align, idx
   t = max_time-2
-  final_t, final_alignments, final_idx = tf.while_loop(lambda t, idx, _: tf.greater(t, 0),
+  final_t, final_alignments, final_label_align_ta, final_idx = tf.while_loop(lambda t, idx, _, _2: tf.greater_equal(t, 0),
                                                        body,
-                                                       (t, alignments, initial_idx))
-  final_alignments = final_alignments.write(0, final_idx)
-  return tf.transpose(final_alignments.stack())  # (T, B) -> (B, T)
+                                                       (t, alignments, label_align, initial_idx))
+  # final_alignments = final_alignments.write(0, final_idx)
+  # label_idxs = tf.stack([
+  #   tf.range(n_batch),  # (B,)
+  #   final_idx,  # (B,)
+  # ], axis=-1)  # (B, 2)
+  # final_label_align_ta = final_label_align_ta.write(0, tf.where(tf.less_equal(t, input_lens - 1), tf.gather_nd(labels, label_idxs),
+  #                                             tf.zeros_like(final_idx)))
+
+  final_label_alignment = final_label_align_ta.stack()
+  # return tf.transpose(final_alignments.stack())  # (T, B) -> (B, T)
+  return tf.transpose(final_label_alignment)
 
 
-def compute_alignment(bt_mat, input_lens, label_lens):
+def compute_alignment(bt_mat, input_len, label_len):
   """Computes the alignment from the backtracking matrix."""
-  n_batch = input_lens.shape[0]
-  alignments = []
-  assert input_lens.shape == label_lens.shape
-  for i in range(n_batch):
-    print("Computing alignment for BT: (%r), T=%d, U-1=%d" %
-          (bt_mat[i, :input_lens[i]+1, :label_lens[i]].shape, input_lens[i], label_lens[i]-1))
-    idx = bt_mat[i, input_lens[i], label_lens[i]-1]
-    alignment = np.zeros((input_lens[i],), dtype=np.int32)
-    for t in reversed(range(input_lens[i])):
-      alignment[t] = idx
-      print("align [i=%2d, t=%2d] state-idx=%2d" % (i, t, idx))
-      idx = bt_mat[i, t, idx]
-    alignment[0] = idx
-    print("align [i=%2d, t=%2d] state-idx=%2d" % (i, 0, idx))
-    alignments.append(alignment)
-  return alignments
+  # n_target = labels.shape[0] + 1
+  # labels = np.concatenate([[0], labels])
+  # print("Computing alignment for T=%d, U-1=%d, label-seq: %s" %
+  #       (input_len, label_len-1, labels))
+  idx = bt_mat[input_len, label_len-1]
+  # label = bt_mat_label[i, input_lens[i], label_lens[i]-1]
+  alignment = np.ones((input_len,), dtype=np.int32) * 99
+  # def map_idx_to_label(idx, labels, blank_index):
+  #   return labels[idx]
+    # return labels[idx] if idx != n_target else blank_index
+  label_align = np.zeros_like(alignment)
+  for t in reversed(range(1, input_len)):
+    alignment[t] = idx[0]
+    # last state == blank state
+    label_align[t] = idx[1]
+    print("align [t=%2d] state-idx=%2d, label=%2d" % (t, idx[0], label_align[t]))
+    # print("(t=%2d, u=%2d) -> (t=%2d, u=%2d)" % (t-1, bt_mat[i, t, idx], t, idx))
+    idx = bt_mat[t, idx[0]]
+  alignment[0] = idx[0]
+  label_align[0] = idx[1]
+  # print(label_align)
+  # print("align [t=%2d] state-idx=%2d" % (0, idx))
+  return label_align
 
 
 def numpy_forward_batched(log_probs, labels, blank_index, input_lens, label_lens, debug=False,
@@ -242,7 +294,8 @@ def numpy_forward_batched(log_probs, labels, blank_index, input_lens, label_lens
   """Forward calculation of the RNA loss using the same strategy as the TF impl."""
   n_batch, max_time, max_target, n_vocab = log_probs.shape  # (B, T, U, V)
   assert labels.shape == (n_batch, max_target-1)  # (B, U-1)
-  if debug or True:
+  # blank_state = max_target-1  # this is actually U
+  if debug:
     print("U=%d, T=%d, V=%d" % (max_target-1, max_time, n_vocab))
     print("log-probs: (B=%d, T=%d, U+1=%d, V=%d)" % (n_batch, max_time, max_target, n_vocab))
     print("labels: (B=%d, U-1=%d)" % (n_batch, labels.shape[1]))
@@ -254,7 +307,7 @@ def numpy_forward_batched(log_probs, labels, blank_index, input_lens, label_lens
       print("[n=%2d]" % n, *vars)
   # alpha columns
   alphas = [[], np.zeros((n_batch, 1))]
-  bt_mat = np.zeros((n_batch, max_time+1, max_target), dtype=np.int32)
+  bt_mat = np.zeros((n_batch, max_time+1, max_target, 2), dtype=np.int32)
 
   for n in range(2, max_time+2):
     # actually previous one.
@@ -350,13 +403,49 @@ def numpy_forward_batched(log_probs, labels, blank_index, input_lens, label_lens
       new_column = np.logaddexp(new_column, same)
 
     # sum_args: (3|2, B, N)
+    # we want to compute this:
+    # argmax_dict = {0: (u, blank_index),  # skip, blank symbol.
+    #                1: (u - 1, labels[u - 1]),  # (t-1, u-1),  # emit
+    #                2: (u, labels[u - 1]),  # (t-1, u),    # same
+    #                }
+    # bt_mat[t, u] = argmax_dict[argmax_idx]
+
     argmax_idx = np.argmax(sum_args, axis=0)  # (B, N) -> [2|3]
     max_len = sum_args[0].shape[1]  # np.minimum(n-1, max_target)
-    u_ranged = np.expand_dims(np.arange(max_len), axis=0)  # (1, U|n)
+    u_ranged = np.tile(np.expand_dims(np.arange(max_len), axis=0), [n_batch, 1])  # (B, U|n)
+    # (B, U) ; (B, 1) -> (B, U+1), we do this to allow vectorized access to the labels
+    blank_tiled = np.tile([[blank_index]], [n_batch, 1])  # (B, 1)
+    labels_exp = np.concatenate([labels, blank_tiled], axis=1)
     u_ranged_shifted = u_ranged - 1
+    # np.meshgrid(
+    #
+    # )
+    b, r = np.meshgrid(
+      np.arange(n_batch),
+      np.maximum(0, np.arange(max_len) - 1),
+      indexing='ij'
+    )
+    label_idxs = np.stack([b, r], axis=-1)
+    # labels_emit = labels_exp[label_idxs]  # (B, n)  labels[u-1]
+    # labels_emit = labels_exp[np.arange(n_batch), np.maximum(0, np.arange(max_len) - 1)]
+    labels_emit = labels_exp[np.arange(n_batch)[:, np.newaxis], np.maximum(0, np.arange(max_len)[np.newaxis, :]-1)]
+    labels_same = labels_emit
+
+    # labels_emit = labels_exp[np.arange(n_batch), u_ranged_shifted]  # (B, n) labels[u-1]
+    # labels_same = labels_exp[np.arange(n_batch), u_ranged_shifted]  # labels[u-1]
     # we track the state where the arc came from:
-    # bt_mat: (B, T, U)           blank           emit           same
-    sel = np.where(np.logical_or(argmax_idx == 0, argmax_idx == 2), u_ranged, u_ranged_shifted)
+    # bt_mat: (B, T, U, 2)           blank           emit           same
+    # last dimension is (state-idx, label-idx)
+    sel_blank = np.stack([u_ranged, np.tile(blank_tiled, [1, max_len])], axis=-1)  # (B,)
+    sel_emit = np.stack([u_ranged_shifted, labels_emit], axis=-1)  # (1,U|n) | (B, U|n)-> (B, n, 2)
+    # bt_mat[np.arange(n_batch), np.array([t]), idx[:, 0]]  # (B,)
+    sel_same = np.stack([u_ranged, labels_same], axis=-1)
+    sel = np.where((argmax_idx == 0)[...,np.newaxis],
+                   sel_blank,  # blank
+                   np.where((argmax_idx == 1)[...,np.newaxis],
+                            sel_emit,  # emit
+                            sel_same))  # same
+
     bt_mat[:, n-1, :max_len] = sel
 
     print_debug(n, "new_column", new_column)
@@ -367,8 +456,8 @@ def numpy_forward_batched(log_probs, labels, blank_index, input_lens, label_lens
 
   list_nll = []
   col_idxs = input_lens + 1  # (B,)
-  print("[np batched] T=%r U=%r" % (input_lens, label_lens))
-  print(bt_mat[0])
+  if debug:
+    print("[np batched] T=%r U=%r" % (input_lens, label_lens))
 
   # backtracking
   alignments_np = compute_alignment_numpy_batched(bt_mat, input_lens, label_lens+1)
@@ -412,6 +501,8 @@ def tf_forward_shifted_rna(log_probs, labels, input_lengths=None, label_lengths=
   max_time = shape[1]    # T
   max_target = shape[2]  # U+1
 
+  blank_state = max_target - 1  # this is actually U
+
   num_columns = max_time + 2
 
   labels = py_print_iteration_info("labels", labels, 0, debug=debug)
@@ -446,10 +537,12 @@ def tf_forward_shifted_rna(log_probs, labels, input_lengths=None, label_lengths=
       size=num_columns-1,
       dynamic_size=False,
       infer_shape=True,
-      element_shape=(None, None,),  # (B, U)
+      element_shape=(None, None, 2),  # (B, U)
       name="bt_columns",
     )  # (T, B, U)
-    bt_ta = bt_ta.write(0, tf.zeros((n_batch, max_target), dtype=tf.int32))
+    zero_state = tf.zeros((n_batch, max_target), dtype=tf.int32)
+    initial_align_tuple = tf.stack([zero_state, tf.ones_like(zero_state)*blank_index], axis=-1)  # (B, U, 2)
+    bt_ta = bt_ta.write(0, initial_align_tuple)
   else:
     bt_ta = None
 
@@ -572,10 +665,49 @@ def tf_forward_shifted_rna(log_probs, labels, input_lengths=None, label_lengths=
       u_ranged_shifted = u_ranged - 1
       # we track the state where the arc came from:
       # bt_mat: (B, T, U)           blank (u)           emit (u-1)           same (u)
-      sel = tf.where(tf.logical_or(tf.equal(argmax_idx, 0), tf.equal(argmax_idx, 2)),
-                     u_ranged, u_ranged_shifted)  # (B, U|n)
+      # blank_tiled = np.tile([[blank_index]], [n_batch, 1])  # (B, 1)
+      # labels_exp = np.concatenate([labels, blank_tiled], axis=1)
+      # u_ranged_shifted = u_ranged - 1
+      # labels_emit = labels_exp[np.arange(n_batch), u_ranged_shifted]  # labels[u-1]
+      # labels_same = labels_exp[np.arange(n_batch), u_ranged_shifted]  # labels[u-1]
+      # we track the state where the arc came from:
+      # bt_mat: (B, T, U, 2)           blank           emit           same
+      # last dimension is (state-idx, label-idx)
+      # sel_blank = np.stack([u_ranged, np.tile(blank_tiled, [1, max_len])], axis=-1)  # (B,)
+      # sel_emit = np.stack([u_ranged_shifted, labels_emit], axis=-1)  # (1,U|n) | (B, U|n)-> (B, n, 2)
+      # sel_same = np.stack([u_ranged, labels_same], axis=-1)
+      # sel = np.where((argmax_idx == 0)[..., np.newaxis],
+      #                sel_blank,  # blank
+      #                np.where((argmax_idx == 1)[..., np.newaxis],
+      #                         sel_emit,  # emit
+      #                         sel_same))  # same
+      blank_tiled = tf.tile([[blank_index]], [n_batch, 1])  # (B, 1)
+      labels_exp = tf.concat([labels, blank_tiled], axis=1)  # (B, U+1)
+      # label_idxs = tf.stack([
+      #   tf.range(n_batch),
+      #   tf.range(max_len)-1,
+      # ], axis=-1)  # (B, 2)
+      b, r = tf.meshgrid(
+        tf.range(n_batch),
+        tf.maximum(0, tf.range(max_len)-1),
+        indexing='ij'
+      )
+      label_idxs = tf.stack([b, r], axis=-1)
+      labels_emit = tf.gather_nd(labels_exp, label_idxs)  # (B, n)  labels[u-1]
+      labels_same = labels_emit
+      sel_blank = tf.stack([u_ranged, tf.tile(blank_tiled, [1, max_len])], axis=-1)
+      sel_emit = tf.stack([u_ranged_shifted, labels_emit], axis=-1)  # (B, n) | (B,)
+      sel_same = tf.stack([u_ranged, labels_same], axis=-1)
+
+      argmax_idx_tiled = tf.tile(argmax_idx[..., tf.newaxis], [1, 1, 2])  # (B, n, 2)
+      sel = tf.where(tf.equal(argmax_idx_tiled, 0),
+                     sel_blank,  # blank
+                     tf.where(tf.equal(argmax_idx_tiled, 1),
+                              sel_emit,  # emit
+                              sel_same))  # same
+                     # u_ranged, u_ranged_shifted)  # (B, U|n)
       # we need to pad so we can stack the TA later on (instead of triangular shape)
-      sel_padded = tf.pad(sel, [[0, 0], [0, max_target - max_len]])
+      sel_padded = tf.pad(sel, [[0, 0], [0, max_target - max_len], [0, 0]])
       bt_ta = bt_ta.write(n-1, sel_padded)
     else:
       bt_ta = None
@@ -599,7 +731,7 @@ def tf_forward_shifted_rna(log_probs, labels, input_lengths=None, label_lengths=
                                   name="rna_loss")
   if with_alignment:
     final_n, alpha_out_ta, bt_ta = final_loop_vars
-    bt_mat = tf.transpose(bt_ta.stack(), [1, 0, 2])  # (T, B, U) -> (B, T, U)
+    bt_mat = tf.transpose(bt_ta.stack(), [1, 0, 2, 3])  # (T, B, U, 2) -> (B, T, U, 2)
     alignments = compute_alignment_tf(bt_mat, input_lengths, label_lengths+1)
   else:
     final_n, alpha_out_ta = final_loop_vars
@@ -708,9 +840,7 @@ def test_impl(name, acts, labels, blank_index, input_lens=None, label_lens=None,
   list_alignments = []
   for i in range(n_batch):
     log_probs_i = log_probs[i, :input_lens[i], :label_lens[i]+1, :]
-    print(labels)
     labels_i = labels[i, :label_lens[i]]
-    print(labels_i)
     input_len = input_lens[i]
     assert log_probs_i.shape == (input_len, labels_i.shape[0] + 1, n_vocab)
     alphas, ll_forward = forward_pass(log_probs_i, labels_i, blank_index)
@@ -736,6 +866,8 @@ def test_impl(name, acts, labels, blank_index, input_lens=None, label_lens=None,
                               debug=debug)
     if with_alignment:
       alpha_np_naive, cost_np_naive, alignment_naive = res
+      if debug or True:
+        print("[np naive] alignments:", alignment_naive)
       list_alignments += [alignment_naive]
     else:
       alpha_np_naive, cost_np_naive = res
@@ -756,9 +888,8 @@ def test_impl(name, acts, labels, blank_index, input_lens=None, label_lens=None,
                                  debug=debug)
   if with_alignment:
     costs_np, alignments_np = res_np
-    if debug:
-      print("[np batched] alignments:")
-      print(alignments_np)
+    if debug or True:
+      print("[np batched] alignments:", alignments_np)
     for i in range(n_batch):
       np.testing.assert_allclose(alignments_np[i][:input_lens[i]], list_alignments[i])
   else:
@@ -812,6 +943,8 @@ def test_impl(name, acts, labels, blank_index, input_lens=None, label_lens=None,
   print_results("Tensorflow", nll_tf, grads_tf)
 
   if with_alignment:
+    if debug or True:
+      print("[TF] alignments:", alignments_np)
     np.testing.assert_equal(alignments_tf, alignments_np)
 
   assert np.isfinite(grads_tf).all(), "Found non-finite values in TF gradients."
@@ -861,12 +994,12 @@ def test_small():
   """Small test, copied from
     https://github.com/awni/transducer/blob/master/ref_transduce.py
   """
-  blank_index = 0
-  vocab_size = 4
+  blank_index = 200
+  vocab_size = 201
   input_len = 5
   output_len = 4
   acts = np.random.rand(input_len, output_len, vocab_size)
-  labels = np.array([1, 2, 3])
+  labels = np.array([23, 44, 92])
   test_impl("test_small", acts, labels, blank_index, with_alignment=True)
 
 
@@ -918,7 +1051,7 @@ def test_sizes():
 
 def test_blank_idx_nonzero():
   """Tests when the blank-idx is not 0."""
-  n_time = 2
+  n_time = 8
   n_target = 3
   n_vocab = 5
   acts = np.random.standard_normal((n_time, n_target, n_vocab))
@@ -1032,12 +1165,12 @@ def run_all_tests():
   test_real()
   test_batched_tiled()
   test_small()
-  test_small_labelrep()
-  test_size_t_greater_u()
-  test_size_t_equal_u()
-  test_sizes()
+  # test_small_labelrep()
+  # test_size_t_greater_u()
+  # test_size_t_equal_u()
+  # test_sizes()
   test_blank_idx_nonzero()
-  test_big()
+  # test_big()
 
 
 if __name__ == '__main__':
