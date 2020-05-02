@@ -64,11 +64,6 @@ def numpy_forward_naive(log_probs, labels, blank_index, label_rep=False, with_al
     print("labels: ", labels)
     print("U=%d, T=%d, V=%d" % (n_target, n_time, n_vocab))
   bt_mat = np.ones((n_time+1, n_target+1, 2), dtype=np.int32) * 0  # store hat{x_j} of the most likely path so far
-  # bt_label =
-  # bt_mat_label = np.zeros((n_time + 1, n_target), dtype=np.int32)  # store hat{y_j} of the current most likely path
-  # blank_state = max(n_target - 1, n_time)  # so that it is definitely last
-  # blank_state = n_target - 1
-  blank_state = 0
   bt_mat[0, 0] = (0, 0)
 
   for t in range(1, n_time+1):
@@ -83,8 +78,6 @@ def numpy_forward_naive(log_probs, labels, blank_index, label_rep=False, with_al
     if t < n_target:
       alpha[t, t] = alpha[t-1, t-1] + log_probs[t-1, t-1, labels[t-1]]
       bt_mat[t, t] = (t-1, labels[t-1])
-      # bt_mat_label[t-1, t-1] = labels[t-1]
-      # bt_mat_score[t, t] = log_probs[t-1, t-1, labels[t-1]]
 
     for u in range(1, min(t, n_target)):
       skip = alpha[t - 1, u] + log_probs[t - 1, u, blank_index]
@@ -107,7 +100,7 @@ def numpy_forward_naive(log_probs, labels, blank_index, label_rep=False, with_al
                      2: (u, labels[u-1]),    # (t-1, u),    # same
                      }
       argmax_tuple = argmax_dict[max_prob_idx]
-      if debug or True:
+      if debug:
         print("[np naive] BT[%2d,%2d] = (%s) %d state=%d, label=%d" % (
           t - 1, u, {0: "skip", 1: "emit", 2: "same"}[max_prob_idx],
           max_prob_idx, argmax_tuple[0], argmax_tuple[1]))
@@ -130,20 +123,20 @@ def numpy_forward_naive(log_probs, labels, blank_index, label_rep=False, with_al
     print(alpha)
   nll = - alpha[n_time, n_target-1]
   np.set_printoptions(precision=3, linewidth=120)
-  # print("[np naive] backtrack matrix:")
-  # print(bt_mat)
-  # print("[np naive] backtrack matrix labels:")
-  # print(bt_mat_label)
+  if debug:
+    print("[np naive] backtrack matrix:")
+    print(bt_mat)
   alignment = compute_alignment(bt_mat, n_time, n_target)
   alignment_batched = compute_alignment_numpy_batched(bt_mat[np.newaxis, ...],
                                                       np.array([n_time]), np.array([n_target]))
-  print("[np naive] batched alignment:", alignment_batched[0])
-  with sess.as_default():
-    align = compute_alignment_tf(tf.expand_dims(bt_mat, axis=0),
-                                 tf.constant([n_time]), tf.constant([n_target]))
-    align_tf = align.eval()
-    print("[np naive] TF alignment:", align_tf[0])
-    np.testing.assert_equal(align_tf, alignment_batched)
+  if debug:
+    print("[np naive] batched alignment:", alignment_batched[0])
+    with sess.as_default():
+      align = compute_alignment_tf(tf.expand_dims(bt_mat, axis=0),
+                                   tf.constant([n_time]), tf.constant([n_target]))
+      align_tf = align.eval()
+      print("[np naive] TF alignment:", align_tf[0])
+      np.testing.assert_equal(align_tf, alignment_batched)
   assert len(alignment) == n_time
   if debug:
     print("negative log-likelihood = - alpha[%d, %d] = %.4f" %
@@ -170,8 +163,6 @@ def compute_alignment_numpy_batched(bt_mat, input_lens, label_lens):
   assert track_dim == 2
   # blank_state = max_target - 1
   # (B, U) -> (B, U+1), add blank last state (such that we can do labels[idx])
-  # labels = np.concatenate([labels, np.tile([[blank_index]], [n_batch])], axis=1)
-  # labels = np.concatenate([np.tile([[blank_index]], [n_batch]), labels], axis=1)
   alignments = np.zeros((n_batch, max_time-1), dtype=np.int32)
   label_align = np.zeros_like(alignments)
   idx = bt_mat[np.arange(n_batch), input_lens, label_lens-1]
@@ -185,8 +176,6 @@ def compute_alignment_numpy_batched(bt_mat, input_lens, label_lens):
     cond = (t > input_lens - 1)[:, np.newaxis]
     idx = np.where(cond, initial_idx, idx)
     assert idx.shape == (n_batch, 2)
-  # print(label_align)
-  # return alignments
   return label_align
 
 
