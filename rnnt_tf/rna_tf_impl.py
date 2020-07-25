@@ -169,7 +169,6 @@ def compute_alignment_numpy_batched(bt_mat, input_lens, label_lens):
   initial_idx = idx
   for t in reversed(range(max_time-1)):
     assert idx.shape == (n_batch, 2)
-    print("[np batched] t=%2d idx=" % t, idx)
     alignments[:, t] = np.where(t <= input_lens - 1, idx[:, 0], 0)  # (B,) masked invalid
     label_align[:, t] = np.where(t <= input_lens - 1, idx[:, 1], 0)  # (B,) masked invalid
     idx = bt_mat[np.arange(n_batch), np.array([t]), idx[:, 0]]  # (B,)
@@ -481,9 +480,6 @@ def tf_forward_shifted_rna(log_probs, labels, input_lengths=None, label_lengths=
   n_batch = shape[0]     # B
   max_time = shape[1]    # T
   max_target = shape[2]  # U+1
-
-  blank_state = max_target - 1  # this is actually U
-
   num_columns = max_time + 2
 
   labels = py_print_iteration_info("labels", labels, 0, debug=debug)
@@ -505,11 +501,11 @@ def tf_forward_shifted_rna(log_probs, labels, input_lengths=None, label_lengths=
     clear_after_read=False,
     size=num_columns,
     dynamic_size=False,
-    infer_shape=False,
-    element_shape=(None, None,),  # (B, n)
+    infer_shape=True,
+    element_shape=(None, None),  # (B, U)
     name="alpha_columns",
   )
-  alpha_ta = alpha_ta.write(1, tf.zeros((n_batch, 1)))
+  alpha_ta = alpha_ta.write(1, tf.zeros((n_batch, max_target)))
 
   if with_alignment:
     bt_ta = tf.TensorArray(
@@ -540,8 +536,7 @@ def tf_forward_shifted_rna(log_probs, labels, input_lengths=None, label_lengths=
     lp_column = log_probs_ta.read(n-2)[:, :n-1, :]  # (B, U|n, V)
     lp_column = py_print_iteration_info("lp_column", lp_column, n, debug=debug)
 
-    column_maxlen = tf.reduce_min([max_target, n])
-    prev_column = alpha_ta.read(n-1)[:, :column_maxlen]  # (B, n-1)
+    prev_column = alpha_ta.read(n-1)[:, :n-1]  # (B, n-1)
     prev_column = py_print_iteration_info("prev_column", prev_column, n, debug=debug)
 
     alpha_blank = prev_column  # (B, N)
@@ -697,7 +692,7 @@ def tf_forward_shifted_rna(log_probs, labels, input_lengths=None, label_lengths=
     red_op = py_print_iteration_info("red-op", red_op, n, debug=debug)
     new_column = tf.math.reduce_logsumexp(red_op, axis=0)  # (B, N)
 
-    new_column = new_column[:, :n]
+    new_column = tf.pad(new_column[:, :n], [[0, 0], [0, tf.maximum(0, max_target - n)]])
     new_column = py_print_iteration_info("new_column", new_column, n, debug=debug)
     ret_args = [n + 1, alpha_ta.write(n, new_column)]
     return ret_args + [bt_ta] if with_alignment else ret_args
@@ -724,37 +719,17 @@ def tf_forward_shifted_rna(log_probs, labels, input_lengths=None, label_lengths=
 
   # (B,): batch index -> index within column
   within_col_idx = label_lengths
-  within_col_idx = tf.where(tf.less_equal(label_lengths, input_lengths),
-                            within_col_idx,  # everything ok, T>U
-                            tf.ones_like(within_col_idx) * -1)  # U > T, not possible in RNA
 
-  res_ta = tf.TensorArray(
-    dtype=tf.float32,
-    clear_after_read=True,
-    size=n_batch,
-    dynamic_size=False,
-    infer_shape=False,
-    element_shape=(),
-    name="alpha_columns",
-  )
-  tf_neg_inf = tf.constant(NEG_INF)
+  ll_idxs = tf.stack([tf.range(n_batch), col_idxs, within_col_idx], axis=-1)
+  ll = tf.where(tf.less_equal(label_lengths, input_lengths),
+                tf.gather_nd(tf.transpose(alpha_out_ta.stack(), [1, 0, 2]), ll_idxs),
+                tf.zeros_like(label_lengths, dtype=tf.float32)
+                )
 
-  def ta_read_body(i, res_loop_ta):
-    """Reads from the alpha-columns TensorArray. We need this because of the inconsistent shapes in the TA."""
-    ta_item = alpha_out_ta.read(col_idxs[i])[i]
-    elem = tf.cond(tf.equal(within_col_idx[i], -1), lambda: tf_neg_inf, lambda: ta_item[within_col_idx[i]])
-    elem = py_print_iteration_info("FINAL", elem, i, "col_idxs", col_idxs, "within_col_idx:", within_col_idx,
-                                   "column", ta_item, debug=debug)
-    return i+1, res_loop_ta.write(i, elem)
-
-  _, ll_ta = tf.while_loop(
-    lambda i, res_ta: tf.less(i, n_batch),
-    ta_read_body, (tf.constant(0, tf.int32), res_ta)
-  )
   if with_alignment:
-    return ll_ta.stack(), alignments
+    return ll, alignments
   else:
-    return ll_ta.stack()
+    return ll
 
 
 def test_impl(name, acts, labels, blank_index, input_lens=None, label_lens=None,
@@ -816,7 +791,6 @@ def test_impl(name, acts, labels, blank_index, input_lens=None, label_lens=None,
 
   list_ll = []
   list_grads = []
-  list_alphas = []
   list_cost_naive = []
   list_alignments = []
   for i in range(n_batch):
