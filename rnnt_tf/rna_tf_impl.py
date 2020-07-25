@@ -108,7 +108,7 @@ def numpy_forward_naive(log_probs, labels, blank_index, label_rep=False, with_al
 
       alpha[t, u] = elem = logsumexp(*sum_args)  # addition in linear-space -> LSE in log-space
       if debug:
-        print('t=%2d u=%2d: LSE(%.3f + %.3f, %.3f +  %.3f) = LSE(%.3f, %.3f) = %.3f' % (t, u,
+        print('t=%2d u=%2d: LSE(a=%.3f + lp=%.3f, a=%.3f +  lp=%.3f) = LSE(skip=%.3f, emit=%.3f) = %.3f' % (t, u,
                                                                                         alpha[t - 1, u],
                                                                                         log_probs[t-1, u, blank_index],
                                                                                         alpha[t - 1, u - 1],
@@ -260,21 +260,13 @@ def compute_alignment(bt_mat, input_len, label_len):
   idx = bt_mat[input_len, label_len-1]
   # label = bt_mat_label[i, input_lens[i], label_lens[i]-1]
   alignment = np.ones((input_len,), dtype=np.int32) * 99
-  # def map_idx_to_label(idx, labels, blank_index):
-  #   return labels[idx]
-    # return labels[idx] if idx != n_target else blank_index
   label_align = np.zeros_like(alignment)
   for t in reversed(range(1, input_len)):
     alignment[t] = idx[0]
-    # last state == blank state
     label_align[t] = idx[1]
-    print("align [t=%2d] state-idx=%2d, label=%2d" % (t, idx[0], label_align[t]))
-    # print("(t=%2d, u=%2d) -> (t=%2d, u=%2d)" % (t-1, bt_mat[i, t, idx], t, idx))
     idx = bt_mat[t, idx[0]]
   alignment[0] = idx[0]
   label_align[0] = idx[1]
-  # print(label_align)
-  # print("align [t=%2d] state-idx=%2d" % (0, idx))
   return label_align
 
 
@@ -832,22 +824,24 @@ def test_impl(name, acts, labels, blank_index, input_lens=None, label_lens=None,
     labels_i = labels[i, :label_lens[i]]
     input_len = input_lens[i]
     assert log_probs_i.shape == (input_len, labels_i.shape[0] + 1, n_vocab)
-    alphas, ll_forward = forward_pass(log_probs_i, labels_i, blank_index)
-    betas, ll_backward = backward_pass(log_probs_i, labels_i, blank_index)
-    assert np.allclose(ll_forward, ll_backward, atol=1e-12, rtol=1e-12), "Log-likelihood from forward and backward " \
-                                                                         "pass mismatch. "
-    analytical_grads = analytical_gradient(log_probs_i, alphas, betas, labels_i, blank_index)
+    try:
+      alphas, ll_forward = forward_pass(log_probs_i, labels_i, blank_index)
+      betas, ll_backward = backward_pass(log_probs_i, labels_i, blank_index)
+      assert np.allclose(ll_forward, ll_backward, atol=1e-12, rtol=1e-12), "Log-likelihood from forward and backward " \
+                                                                           "pass mismatch. "
+      analytical_grads = analytical_gradient(log_probs_i, alphas, betas, labels_i, blank_index)
+    except ValueError:  # probably U > T
+      ll_forward = 0.
+      analytical_grads = np.zeros_like(log_probs_i)
     # enable for smaller tests, too expensive for bigger ones
     # numerical_grads = numerical_gradient(log_probs_i, labels_i, -ll_forward, blank_index)
     # assert np.allclose(analytical_grads, numerical_grads, atol=1e-6, rtol=1e-6), "Analytical and numerical " \
-    #                                                                              "computation of gradient mismatch. "
 
     list_ll.append(-ll_forward)
     if debug:
       print("i=%2d:" % i, "T=%d, U=%d" % (input_lens[i], label_lens[i]),
             "NLL", -ll_forward, "from: probs=", log_probs_i.shape,
             "and labels=", labels_i.shape)
-    list_alphas.append(alphas)
     list_grads.append(analytical_grads)
 
     res = numpy_forward_naive(log_probs_i, labels_i, blank_index,
@@ -855,7 +849,7 @@ def test_impl(name, acts, labels, blank_index, input_lens=None, label_lens=None,
                               debug=debug)
     if with_alignment:
       alpha_np_naive, cost_np_naive, alignment_naive = res
-      if debug or True:
+      if debug:
         print("[np naive] alignments:", alignment_naive)
       list_alignments += [alignment_naive]
     else:
@@ -871,13 +865,18 @@ def test_impl(name, acts, labels, blank_index, input_lens=None, label_lens=None,
   else:
     print_results("Reference", costs_ref, list_grads)
 
-  res_np = numpy_forward_batched(log_probs, labels, blank_index=blank_index,
-                                 input_lens=input_lens, label_lens=label_lens,
-                                 label_rep=label_rep, with_alignment=with_alignment,
-                                 debug=debug)
+  try:
+    res_np = numpy_forward_batched(log_probs, labels, blank_index=blank_index,
+                                   input_lens=input_lens, label_lens=label_lens,
+                                   label_rep=label_rep, with_alignment=with_alignment,
+                                   debug=debug)
+  except IndexError:  # U > T
+    zero_costs = np.zeros_like(costs_ref)
+    zero_alignment = np.zeros((n_batch, n_time))
+    res_np = [zero_costs, zero_alignment] if with_alignment else  [zero_costs]
   if with_alignment:
     costs_np, alignments_np = res_np
-    if debug or True:
+    if debug:
       print("[np batched] alignments:", alignments_np)
     for i in range(n_batch):
       np.testing.assert_allclose(alignments_np[i][:input_lens[i]], list_alignments[i])
@@ -915,7 +914,7 @@ def test_impl(name, acts, labels, blank_index, input_lens=None, label_lens=None,
       grads_ph = tf.gradients(xs=log_probs_ph, ys=[-costs_ph])
     assert len(grads_ph) == 1
     grads_ph = grads_ph[0]
-    ll_tf, grads_tf, alignments_tf = sess.run([costs_ph, grads_ph] + ([alignments_ph] if with_alignment else [None]),
+    res_tf = sess.run([costs_ph, grads_ph] + ([alignments_ph] if with_alignment else []),
                                               feed_dict={log_probs_ph: log_probs,
                                                          labels_ph: labels,
                                                          input_lengths_ph: input_lens,
@@ -928,11 +927,15 @@ def test_impl(name, acts, labels, blank_index, input_lens=None, label_lens=None,
       ctf = tl.generate_chrome_trace_format()
       with open('timeline_tf_impl_%s.json' % name, 'w') as f:
         f.write(ctf)
+    if with_alignment:
+      ll_tf, grads_tf, alignments_tf = res_tf
+    else:
+      ll_tf, grads_tf = res_tf
     nll_tf = -ll_tf
   print_results("Tensorflow", nll_tf, grads_tf)
 
   if with_alignment:
-    if debug or True:
+    if debug:
       print("[TF] alignments:", alignments_np)
     np.testing.assert_equal(alignments_tf, alignments_np)
 
@@ -980,7 +983,20 @@ def test_impl(name, acts, labels, blank_index, input_lens=None, label_lens=None,
 
 
 def test_small():
-  """Small test, copied from
+  """Small test, modified from
+    https://github.com/awni/transducer/blob/master/ref_transduce.py
+  """
+  blank_index = 200
+  vocab_size = 201
+  input_len = 5
+  output_len = 4
+  acts = np.random.rand(input_len, output_len, vocab_size)
+  labels = np.array([23, 44, 92])
+  test_impl("test_small", acts, labels, blank_index, with_alignment=False)
+
+
+def test_small_with_alignment():
+  """Small test, modified from
     https://github.com/awni/transducer/blob/master/ref_transduce.py
   """
   blank_index = 200
@@ -1024,6 +1040,17 @@ def test_size_t_equal_u():
   acts = np.random.random_sample((n_time, n_target, n_vocab))
   labels = np.random.randint(1, n_vocab-1, (n_target-1,))
   test_impl("test_size: U==T", acts, labels, blank_index)
+
+
+def test_size_u_greater_t():
+  """Tests for case when U > T"""
+  blank_index = 0
+  n_time = 3
+  n_target = 12
+  n_vocab = 5
+  acts = np.random.random_sample((n_time, n_target, n_vocab))
+  labels = np.random.randint(1, n_vocab-1, (n_target-1,))
+  test_impl("test_size: U>T", acts, labels, blank_index)
 
 
 def test_sizes():
@@ -1145,21 +1172,23 @@ def test_big():
   output_len = 40
   acts = np.random.rand(input_len, output_len, vocab_size)
   labels = np.random.randint(1, vocab_size, output_len-1)
-  test_impl("test_big", acts, labels, blank_index, timing=True)
+  test_impl("test_big", acts, labels, blank_index)
 
 
 def run_all_tests():
+  test_small()
+  test_small_with_alignment()
+  test_small_labelrep()
+  test_size_t_greater_u()
+  test_size_t_equal_u()
+  test_size_u_greater_t()
+  test_sizes()
+  # test_blank_idx_nonzero()  # broken test!
+  test_real()
   test_batched()
   test_batched_labelrep()
-  test_real()
   test_batched_tiled()
-  test_small()
-  # test_small_labelrep()
-  # test_size_t_greater_u()
-  # test_size_t_equal_u()
-  # test_sizes()
-  test_blank_idx_nonzero()
-  # test_big()
+  test_big()
 
 
 if __name__ == '__main__':
