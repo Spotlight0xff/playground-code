@@ -371,3 +371,242 @@ def tf_forward_shifted_rna(log_probs, labels, input_lengths=None, label_lengths=
     return ll, alignments
   else:
     return ll
+
+
+def rna_loss_gather(log_probs, labels, input_lengths=None, label_lengths=None, blank_index=0,
+                    label_rep=False, with_alignment=False, debug=False):
+  """
+  Computes the batched forward pass of the RNA model.
+  B: batch, T: time, U:target/labels, V: vocabulary
+
+  :param tf.Tensor log_probs: (B, T, U+1, V) log-probabilities
+  :param tf.Tensor labels: (B, U) -> [V] labels
+  :param tf.Tensor input_lengths: (B,) length of input frames
+  :param tf.Tensor label_lengths: (B,) length of labels
+  :param int blank_index: index of the blank symbol in the vocabulary
+  :param bool with_alignment: Also computes and returns the best-path alignment
+  :param bool debug: enable verbose logging
+  :return:
+  """
+  assert not label_rep, "Not implemented"
+  shape = tf.shape(log_probs)
+  n_batch = shape[0]     # B
+  max_time = shape[1]    # T
+  max_target = shape[2]  # U+1
+  num_columns = max_time + 2
+
+  labels = py_print_iteration_info("labels", labels, 0, debug=debug)
+  batchs, rows, cols = tf.meshgrid(
+    tf.range(n_batch),
+    tf.range(max_time),
+    tf.range(max_target),
+    indexing='ij'
+  )
+  targets_exp_filed = tf.tile(labels[:, tf.newaxis, :], [1, max_time, 1])  # (B, T, U)
+  # such that the dimensions align, the last target (0) will never be accessed.
+  targets_exp_filed = tf.concat([targets_exp_filed, tf.zeros((n_batch, max_time, 1), dtype=tf.int32)],
+                                axis=-1)  # (B, T, U+1)
+  lp_y_idxs = tf.stack([batchs,
+                        rows,
+                        cols,
+                        targets_exp_filed
+                        ], axis=-1)  # (B, T, U+1, 4)
+  lp_blank_idxs = tf.stack([
+    batchs, rows, cols,
+    tf.ones((n_batch, max_time, max_target), dtype=tf.int32) * blank_index
+  ], axis=-1)
+
+  # TODO: combine both gather_nd calls.
+
+  lp_y = tf.gather_nd(log_probs, lp_y_idxs)  # (B, T, U)
+  lp_blank = tf.gather_nd(log_probs, lp_blank_idxs)  # (B, T, U)
+
+  lp_gather = tf.stack([lp_y, lp_blank], axis=-1)  # (B, T, U, 2)
+  # better time-first for time-sync algorithm
+  lp_gather_t = tf.transpose(lp_gather, [1, 0, 2, 3])  # (T, B, U, 2)
+
+  log_probs_ta = tf.TensorArray(
+    dtype=tf.float32,
+    clear_after_read=False,
+    size=num_columns,
+    dynamic_size=False,
+    infer_shape=False,
+    element_shape=(None, None, 2),  # (B, U, 2)
+    name="log_probs",
+  )
+  # (B, T, U, V) -> [(B, U, V)] * (T)
+  log_probs_ta = log_probs_ta.unstack(lp_gather_t)
+
+  alpha_ta = tf.TensorArray(
+    dtype=tf.float32,
+    clear_after_read=False,
+    size=num_columns,
+    dynamic_size=False,
+    infer_shape=True,
+    element_shape=(None, None),  # (B, U)
+    name="alpha_columns",
+  )
+  alpha_ta = alpha_ta.write(1, tf.zeros((n_batch, max_target)))
+
+  if with_alignment:
+    bt_ta = tf.TensorArray(
+      dtype=tf.int32,
+      clear_after_read=False,
+      size=num_columns-1,
+      dynamic_size=False,
+      infer_shape=True,
+      element_shape=(None, None, 2),  # (B, U)
+      name="bt_columns",
+    )  # (T, B, U)
+    zero_state = tf.zeros((n_batch, max_target), dtype=tf.int32)
+    initial_align_tuple = tf.stack([zero_state, tf.ones_like(zero_state)*blank_index], axis=-1)  # (B, U, 2)
+    bt_ta = bt_ta.write(0, initial_align_tuple)
+  else:
+    bt_ta = None
+
+  def cond(n, *args):
+    """We run the loop until all input-frames have been consumed.
+    """
+    return tf.less(n, num_columns)
+
+  def body_forward(n, alpha_ta, *args):
+    """body of the while_loop, loops over the columns of the alpha-tensor."""
+    # alpha(t-1,u-1) + logprobs(t-1, u-1)
+    # alpha_blank      + lp_blank
+
+    lp_column = log_probs_ta.read(n-2)[:, :n-1, :]  # (B, U|n, 2), y|blank
+    lp_column = py_print_iteration_info("lp_column", lp_column, n, debug=debug)
+
+    prev_column = alpha_ta.read(n-1)[:, :n-1]  # (B, n-1)
+    prev_column = py_print_iteration_info("prev_column", prev_column, n, debug=debug)
+
+    alpha_blank = prev_column  # (B, N)
+    alpha_blank = tf.concat([alpha_blank, tf.tile([[tf.constant(NEG_INF)]], [n_batch, 1])], axis=1)
+    alpha_blank = py_print_iteration_info("alpha(blank)", alpha_blank, n, debug=debug)
+
+    # (B, U, V) -> (B, U)
+    lp_blank = lp_column[:, :, 1]  # (B, U)
+    lp_blank = tf.concat([lp_blank, tf.tile([[tf.constant(NEG_INF)]], [n_batch, 1])], axis=1)
+    lp_blank = py_print_iteration_info("lp(blank)", lp_blank, n, debug=debug)
+
+    # (B,N-1) ; (B,1) ->  (B, N)
+    alpha_y = prev_column
+    alpha_y = tf.concat([tf.tile([[tf.constant(NEG_INF)]], [n_batch, 1]), alpha_y], axis=1)
+    alpha_y = py_print_iteration_info("alpha(y)", alpha_y, n, debug=debug)
+
+    # labels_maxlen = tf.minimum(max_target-1, n-1)
+    # labels_shifted = labels[:, :labels_maxlen]  # (B, U-1|n-1)
+    # labels_shifted = py_print_iteration_info("labels_shifted", labels_shifted, n, debug=debug)
+    # batchs, rows = tf.meshgrid(
+    #   tf.range(n_batch),
+    #   tf.range(labels_maxlen),
+    #   indexing='ij'
+    # )
+    # lp_y_idxs = tf.stack([batchs, rows, labels_shifted], axis=-1)  # (B, U-1|n-1, 3)
+    # lp_y_idxs = py_print_iteration_info("lp_y_idxs", lp_y_idxs, n, debug=debug)
+    # lp_y = tf.gather_nd(lp_column[:, :, :], lp_y_idxs)  # (B, U)
+    # (B, U) ; (B, 1) -> (B, U+1)
+    lp_y = lp_column[:, :, 0]  # (B, U)
+    lp_y = tf.concat([tf.tile([[tf.constant(NEG_INF)]], [n_batch, 1]), lp_y], axis=1)
+    lp_y = py_print_iteration_info("lp(y)", lp_y, n, debug=debug)
+
+    cut_off = max_target
+    alpha_y = tf.cond(tf.greater(n, max_target),
+                      lambda: alpha_y[:, :cut_off],
+                      lambda: alpha_y)
+    lp_y = tf.cond(tf.greater(n, max_target),
+                   lambda: lp_y[:, :cut_off],
+                   lambda: lp_y)
+    lp_blank = tf.cond(tf.greater(n, max_target),
+                       lambda: lp_blank[:, :cut_off],
+                       lambda: lp_blank)
+    alpha_blank = tf.cond(tf.greater(n, max_target),
+                          lambda: alpha_blank[:, :cut_off],
+                          lambda: alpha_blank)
+
+    # all should have shape (B, n)
+    blank = alpha_blank + lp_blank
+    y = alpha_y + lp_y
+
+    reduction_args = [blank, y]
+
+    # We can compute the most probable path
+    if with_alignment:
+      bt_ta = args[0]
+      # reduction_args: (3|2, B, N)
+      argmax_idx = tf.argmax(reduction_args, axis=0)  # (B, N) -> [2|3]
+      max_len = tf.shape(reduction_args[0])[1]
+      u_ranged = tf.tile(tf.expand_dims(tf.range(max_len), axis=0), [n_batch, 1])  # (1, U|n)
+      u_ranged_shifted = u_ranged - 1
+      # we track the state where the arc came from:
+      # bt_mat: (B, T, U)           blank (u)           emit (u-1)           same (u)
+      blank_tiled = tf.tile([[blank_index]], [n_batch, 1])  # (B, 1)
+      labels_exp = tf.concat([labels, blank_tiled], axis=1)  # (B, U+1)
+      b, r = tf.meshgrid(
+        tf.range(n_batch),
+        tf.maximum(0, tf.range(max_len)-1),
+        indexing='ij'
+      )
+      label_idxs = tf.stack([b, r], axis=-1)
+      labels_emit = tf.gather_nd(labels_exp, label_idxs)  # (B, n)  labels[u-1]
+      labels_same = labels_emit
+      sel_blank = tf.stack([u_ranged, tf.tile(blank_tiled, [1, max_len])], axis=-1)
+      sel_emit = tf.stack([u_ranged_shifted, labels_emit], axis=-1)  # (B, n) | (B,)
+      sel_same = tf.stack([u_ranged, labels_same], axis=-1)
+
+      argmax_idx_tiled = tf.tile(argmax_idx[..., tf.newaxis], [1, 1, 2])  # (B, n, 2)
+      sel = tf.where(tf.equal(argmax_idx_tiled, 0),
+                     sel_blank,  # blank
+                     tf.where(tf.equal(argmax_idx_tiled, 1),
+                              sel_emit,  # emit
+                              sel_same))  # same
+                     # u_ranged, u_ranged_shifted)  # (B, U|n)
+      # we need to pad so we can stack the TA later on (instead of triangular shape)
+      sel_padded = tf.pad(sel, [[0, 0], [0, max_target - max_len], [0, 0]])
+      bt_ta = bt_ta.write(n-1, sel_padded)
+    else:
+      bt_ta = None
+
+    red_op = tf.stack(reduction_args, axis=0)  # (2, B, N)
+    red_op = py_print_iteration_info("red-op", red_op, n, debug=debug)
+    new_column = tf.math.reduce_logsumexp(red_op, axis=0)  # (B, N)
+
+    new_column = tf.pad(new_column[:, :n], [[0, 0], [0, tf.maximum(0, max_target - n)]])
+    new_column = py_print_iteration_info("new_column", new_column, n, debug=debug)
+    ret_args = [n + 1, alpha_ta.write(n, new_column)]
+    return ret_args + [bt_ta] if with_alignment else ret_args
+
+  n = tf.constant(2)
+  initial_vars = [n, alpha_ta]
+  if with_alignment:
+    initial_vars += [bt_ta]
+  final_loop_vars = tf.while_loop(cond, body_forward,
+                                  initial_vars,
+                                  parallel_iterations=1,  # iterative computation
+                                  name="rna_loss")
+  if with_alignment:
+    final_n, alpha_out_ta, bt_ta = final_loop_vars
+    bt_mat = tf.transpose(bt_ta.stack(), [1, 0, 2, 3])  # (T, B, U, 2) -> (B, T, U, 2)
+    alignments = compute_alignment_tf(bt_mat, input_lengths, label_lengths+1)
+  else:
+    final_n, alpha_out_ta = final_loop_vars
+  # p(y|x) = alpha(T,U) * blank(T,U)  (--> in log-space)
+  # ll_tf = final_alpha[n_time-1, n_target-1]
+
+  # (B,): batch index -> column index
+  col_idxs = input_lengths + 1   # (B,)
+
+  # (B,): batch index -> index within column
+  within_col_idx = label_lengths
+
+  ll_idxs = tf.stack([tf.range(n_batch), col_idxs, within_col_idx], axis=-1)
+  ll = tf.where(tf.less_equal(label_lengths, input_lengths),
+                tf.gather_nd(tf.transpose(alpha_out_ta.stack(), [1, 0, 2]), ll_idxs),
+                tf.zeros_like(label_lengths, dtype=tf.float32)
+                )
+
+  if with_alignment:
+    return ll, alignments
+  else:
+    return ll
+
