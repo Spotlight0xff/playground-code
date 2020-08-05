@@ -335,7 +335,6 @@ def tf_forward_shifted_rna(log_probs, labels, input_lengths=None, label_lengths=
     red_op = py_print_iteration_info("red-op", red_op, n, debug=debug)
     new_column = tf.math.reduce_logsumexp(red_op, axis=0)  # (B, N)
 
-    # new_column = tf.pad(new_column[:, :n], [[0, 0], [0, tf.maximum(0, max_target - n)]])
     new_column = new_column[:, :n]
     new_column = py_print_iteration_info("new_column", new_column, n, debug=debug)
     ret_args = [n + 1, alpha_ta.write(n, new_column)]
@@ -384,7 +383,7 @@ def tf_forward_shifted_rna(log_probs, labels, input_lengths=None, label_lengths=
     elem = tf.cond(tf.equal(within_col_idx[i], -1), lambda: tf_neg_inf, lambda: ta_item[within_col_idx[i]])
     elem = py_print_iteration_info("FINAL", elem, i, "col_idxs", col_idxs, "within_col_idx:", within_col_idx,
                                    "column", ta_item, debug=debug)
-    return i + 1, res_loop_ta.write(i, elem)
+    return i+1, res_loop_ta.write(i, elem)
 
   _, ll_ta = tf.while_loop(
     lambda i, res_ta: tf.less(i, n_batch),

@@ -20,6 +20,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "ret
 from ref_rna import forward_pass, analytical_gradient, backward_pass, numerical_gradient
 from rna_tf_impl import tf_forward_shifted_rna, compute_alignment_tf, rna_loss_gather
 
+
 NEG_INF = -float("inf")
 
 
@@ -837,8 +838,10 @@ def run_all_tests():
 
 
 if __name__ == '__main__':
+  tf.compat.v1.disable_eager_execution() #  need to disable eager in TF2.x
   tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.ERROR)
-  sess = tf.Session()
+  # sess = tf.Session()
+  sess = tf.compat.v1.Session()
   import better_exchook
   better_exchook.install()
 
