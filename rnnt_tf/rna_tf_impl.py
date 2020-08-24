@@ -83,22 +83,15 @@ def compute_alignment_tf(bt_mat, input_lens, label_lens):
       idx[:, 0],  # (B,)
     ], axis=-1)
     idx = tf.gather_nd(bt_mat, idxs)
-    idx = tf.where(tf.greater(t, input_lens - 1), initial_idx, idx)
+    # this is ugly, but works on both TF 1.15 (does not support broadcasting) and 2.3
+    idx = tf.where(tf.tile(tf.greater(t, input_lens - 1)[:, None], [1, 2]), initial_idx, idx)
     return t-1, alignments, label_align, idx
   t = max_time-2
   final_t, final_alignments, final_label_align_ta, final_idx = tf.while_loop(lambda t, idx, _, _2: tf.greater_equal(t, 0),
                                                        body,
                                                        (t, alignments, label_align, initial_idx))
-  # final_alignments = final_alignments.write(0, final_idx)
-  # label_idxs = tf.stack([
-  #   tf.range(n_batch),  # (B,)
-  #   final_idx,  # (B,)
-  # ], axis=-1)  # (B, 2)
-  # final_label_align_ta = final_label_align_ta.write(0, tf.where(tf.less_equal(t, input_lens - 1), tf.gather_nd(labels, label_idxs),
-  #                                             tf.zeros_like(final_idx)))
 
   final_label_alignment = final_label_align_ta.stack()
-  # return tf.transpose(final_alignments.stack())  # (T, B) -> (B, T)
   return tf.transpose(final_label_alignment)
 
 
