@@ -534,8 +534,8 @@ def test_impl(name, acts, labels, blank_index, input_lens=None, label_lens=None,
       run_metadata = tf.RunMetadata()
       tf_run_opts = {'options': run_options, 'run_metadata': run_metadata}
     with tf.device("/cpu:0"):  # run on CPU, so that TF doesn't hog the GPU
-      # ret_ph = tf_forward_shifted_rna(log_probs_ph, labels_ph,
-      ret_ph = rna_loss_gather(log_probs_ph, labels_ph,
+      ret_ph = tf_forward_shifted_rna(log_probs_ph, labels_ph,
+      # ret_ph = rna_loss_gather(log_probs_ph, labels_ph,
                                       input_lengths=input_lengths_ph,
                                       label_lengths=label_lengths_ph,
                                       blank_index=blank_index,
@@ -767,7 +767,7 @@ def test_batched():
     input_lengths = label_lengths + np.random.randint(1, n_time - n_target, (n_batch,))
     labels = np.random.randint(1, n_vocab-1, (n_batch, n_target-1,))  # except blank=0
     test_impl("batched(%d): T=%r, U=%r" % (i, input_lengths, label_lengths), acts, labels, blank_index=0, input_lens=input_lengths,
-              label_lens=label_lengths, timing=False, with_alignment=False, debug=False)
+              label_lens=label_lengths, timing=False, with_alignment=True, debug=False)
 
 
 def test_batched_labelrep():
@@ -822,19 +822,19 @@ def test_big():
 
 
 def run_all_tests():
+  test_batched()
+  test_size_t_greater_u()
   test_small()
   test_small_with_alignment()
-  # test_small_labelrep()
-  test_size_t_greater_u()
+  test_small_labelrep()
   test_size_t_equal_u()
-  test_size_u_greater_t()
-  test_sizes()
-  # test_blank_idx_nonzero()  # broken test!
+  # test_size_u_greater_t()
   test_real()
-  test_batched()
-  # test_batched_labelrep()
+  test_batched_labelrep()
   test_batched_tiled()
   test_big()
+  test_sizes()
+  test_blank_idx_nonzero()  # broken test!
 
 
 if __name__ == '__main__':
