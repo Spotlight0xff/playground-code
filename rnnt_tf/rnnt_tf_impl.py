@@ -870,30 +870,21 @@ def tf_shift_logprobs(mat, axis, axis_to_expand):
   # axis: usually T
   # batch-axis has to be first
   max_time = tf.shape(mat)[axis]  # T
-  n_batch = tf.shape(mat)[0]
-  max_target = tf.shape(mat)[axis_to_expand]
-  n_vocab = tf.shape(mat)[-1]
-  shifts = tf.expand_dims(tf.cast(tf.range(max_time), tf.float32), axis=1)  # (T,1)
-  shifts = shifts[tf.newaxis, :, :, tf.newaxis]
-  shifts = tf.tile(shifts, [n_batch, 1, 1, n_vocab])
-  pads = tf.zeros((n_batch, max_time, max_time, n_vocab), dtype=tf.float32)
-  # (B, T, 1, V) ; (B, T, U, V) ; (B, T, T, V)
-  # -> (B, T, U+T+1, V)
-  a_ranged = tf.concat([shifts, mat, pads], axis=axis_to_expand)  # (T, U+1)
 
-  def fn(x):  # x: (B, U+T+1, V)
+  def fn(args):  # x: (B, U, V)
     """Computes the shift per diagonal and pads accordingly."""
-    shift = tf.cast(x[0][0][0], tf.int32)  # (B,)
-    # 1:U+1 is the original data, in front: shift as wanted, back: padding for shape
-    n = tf.pad(x[:, 1:max_target + 1, :], [[0, 0],  # B
-                                           [shift, max_time + 1 - shift],  # U+T+1
-                                           [0, 0]  # V
-                                           ], constant_values=0)
-    return n
+    x, shift = args
+    padded = tf.pad(x, [[0, 0],  # B
+                        [shift, max_time - shift],  # U+T+1
+                        [0, 0]  # V
+                        ], constant_values=0)
+    return padded, shift
 
-  t = tf.map_fn(fn, elems=tf.transpose(a_ranged, [1, 0, 2, 3]))
-  t = tf.transpose(t, [1, 0, 2, 3])
-  return t[:, :, :-1, :]
+  elems0 = tf.transpose(mat, [1, 0, 2, 3])  # [T, B, U, V]
+  elems1 = tf.range(max_time)  # [T]
+  t, _ = tf.map_fn(fn, elems=(elems0, elems1))  # T* [B, T+U+1, V]
+  t = tf.transpose(t, [1, 0, 2, 3])  # [B, T, U+1, V]
+  return t
 
 
 def tf_forward_shifted(log_probs, labels, input_lengths=None, label_lengths=None, blank_index=0, debug=False):
