@@ -7,13 +7,22 @@ plus comparisons against reference implementations.
 import os
 import sys
 import numpy as np
-import tensorflow as tf
 from termcolor import colored
 from ref_transduce import transduce as transduce_ref
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "returnn"))
-from extern.HawkAaronWarpTransducer import rnnt_loss
-
+from returnn.extern.HawkAaronWarpTransducer import rnnt_loss
+from returnn.tf.compat import v1 as tf
 NEG_INF = -float("inf")
+
+
+class ComputationResult(object):
+  """Represents the information about the computation result,
+  for a comparison across the implementations."""
+  def __init__(self, costs=None, alphas=None, alignments=None, grads=None):
+    self.costs = costs
+    self.alphas = alphas
+    self.alignments = alignments
+    self.grads = grads
 
 
 def logsumexp(*args):  # summation in linear space -> LSE in log-space
@@ -48,7 +57,7 @@ def py_print_iteration_info(msg, var, n, debug=True):
   return var
 
 
-def numpy_forward(log_probs, labels, blank_index, debug=False):
+def numpy_forward(log_probs, labels, blank_index, debug=False) -> ComputationResult:
   """Forward calculation of the RNN-T loss."""
   n_time, n_target, n_vocab = log_probs.shape
   alpha = np.zeros((n_time, n_target))  # 1 in log-space
@@ -96,8 +105,8 @@ def numpy_forward(log_probs, labels, blank_index, debug=False):
 
 def numpy_forward_shifted_batched(log_probs, labels, blank_index, input_lens, label_lens, debug=False):
   """Forward calculation of the RNN-T loss using the same diagonal strategy."""
-  n_batch, max_time, max_target, n_vocab = log_probs.shape  # (B, T, U, V)
-  assert labels.shape == (n_batch, max_target-1)  # (B, U-1)
+  n_batch, max_time, max_target, n_vocab = log_probs.shape  # (B, T, U+1, V)
+  assert labels.shape == (n_batch, max_target-1)  # (B, U)
   if debug:
     print("U=%d, T=%d, V=%d" % (max_target, max_time, n_vocab))
     print("log-probs: (B=%d, T=%d, U=%d, V=%d)" % (n_batch, max_time, max_target, n_vocab))
@@ -105,9 +114,9 @@ def numpy_forward_shifted_batched(log_probs, labels, blank_index, input_lens, la
   num_diagonals = max_time + max_target
 
   with tf.Session().as_default():
-    tf_shifted = tf_shift_logprobs(tf.cast(tf.transpose(log_probs, [0, 2, 1, 3]), dtype=tf.float32),
-                                   axis=1, axis_to_expand=2)
+    tf_shifted = tf_shift_logprobs(tf.cast(tf.transpose(log_probs, [0, 2, 1, 3]), dtype=tf.float32), axis=1)
     shifted_logprobs = sess.run(tf_shifted)
+    assert shifted_logprobs.shape == (n_batch, max_target, max_time+max_target, n_vocab)
     shifted_logprobs = np.transpose(shifted_logprobs, (0, 2, 1, 3))  # (B, U, U+T+1, V) -> (B, U+T+1, U, V)
   assert shifted_logprobs.shape == (n_batch, num_diagonals, max_target, n_vocab)
   if debug:
@@ -198,10 +207,10 @@ def numpy_forward_shifted_batched(log_probs, labels, blank_index, input_lens, la
       print("FINAL i=%d" % i, "a=%.3f + b=%.3f" % (a, b))
     nll = a + b
     list_nll.append(nll)
-  return np.array(list_nll)  # (B,)
+  return ComputationResult(costs=np.array(list_nll))
 
 
-def tf_shift_logprobs(mat, axis, axis_to_expand):
+def tf_shift_logprobs(mat, axis):
   """
   Shifts the log-probs per-batch row-wise.
 
@@ -232,7 +241,8 @@ def tf_shift_logprobs(mat, axis, axis_to_expand):
   return t
 
 
-def tf_forward_shifted(log_probs, labels, input_lengths=None, label_lengths=None, blank_index=0, debug=False):
+def tf_forward_shifted(log_probs, labels, input_lengths=None, label_lengths=None,
+                       blank_index=0, debug=False) -> tf.Tensor:
   """
   Computes the batched forward pass of the RNN-T model.
   B: batch, T: time, U:target/labels, V: vocabulary
@@ -252,7 +262,7 @@ def tf_forward_shifted(log_probs, labels, input_lengths=None, label_lengths=None
   max_target = shape[2]  # U
 
   log_probs_tr = tf.transpose(log_probs, [0, 2, 1, 3])  # (B, T, U, V) -> (B, U, T, V)
-  log_probs_shifted = tf_shift_logprobs(log_probs_tr, axis=1, axis_to_expand=2)  # (B, U+T+1, U, V)
+  log_probs_shifted = tf_shift_logprobs(log_probs_tr, axis=1)  # (B, U+T+1, U, V)
 
   num_diagonals = max_time + max_target
 
@@ -391,6 +401,57 @@ def tf_forward_shifted(log_probs, labels, input_lengths=None, label_lengths=None
   return ll_tf
 
 
+def wrap_tf_rnnt(log_probs, labels, input_lengths=None, label_lengths=None,
+                 blank_index=0, debug=False) -> ComputationResult:
+  with sess.as_default():
+    with tf.name_scope("rnnt_loss"):
+      labels_ph = tf.compat.v1.placeholder(tf.int32, [None, None])
+      log_probs_ph = tf.compat.v1.placeholder(tf.float32, [None, None, None, None])
+      input_lengths_ph = tf.compat.v1.placeholder(tf.int32, [None])
+      label_lengths_ph = tf.compat.v1.placeholder(tf.int32, [None])
+
+      costs_ph = tf_forward_shifted(log_probs_ph, labels_ph,
+                                    input_lengths=input_lengths_ph,
+                                    label_lengths=label_lengths_ph,
+                                    blank_index=blank_index, debug=debug)
+      grads_ph = tf.gradients(xs=log_probs_ph, ys=[-costs_ph])[0]
+      costs_tf, grads_tf = sess.run([costs_ph, grads_ph],
+                                    feed_dict={log_probs_ph: log_probs,
+                                               labels_ph: labels,
+                                               input_lengths_ph: input_lengths,
+                                               label_lengths_ph: label_lengths})
+      return ComputationResult(costs=costs_tf, grads=grads_tf)
+
+
+def wrap_ref_rnnt(log_probs, labels, input_lens, label_lens, blank_index) -> ComputationResult:
+  """Wraps the transducer-ref implementation in our format for comparison."""
+  list_ll = []
+  list_grads = []
+  n_batch = log_probs.shape[0]
+  for i in range(n_batch):
+    cost_ref, grads_ref = transduce_ref(log_probs[i, :input_lens[i] + 1, :label_lens[i] + 1], labels[i, :label_lens[i]],
+                                        blank=blank_index)
+    # np.testing.assert_almost_equal(cost_numpy, cost_ref)
+    list_ll.append(-cost_ref)
+    list_grads.append(grads_ref)
+  costs_ref = np.stack(list_ll, axis=0)
+  grads_ref = np.stack(list_grads, axis=0)
+  return ComputationResult(costs=costs_ref, grads=grads_ref)
+
+
+def wrap_warp_rnnt(log_probs, labels, input_lens, label_lens, blank_index) -> ComputationResult:
+  with sess.as_default():
+    input_lengths_t = tf.constant(input_lens, dtype=tf.int32)  # (B,)
+    label_lengths_t = tf.constant(label_lens, dtype=tf.int32)  # (B,)
+    log_probs_t = tf.constant(log_probs, dtype=tf.float32)  # (B, T, U, V)
+    labels_t = tf.constant(labels, dtype=tf.int32)
+    costs_warprnnt_tf = rnnt_loss(log_probs_t, labels_t,
+                                  input_lengths_t, label_lengths_t, blank_label=blank_index)
+    grads_warprnnt_tf = tf.gradients(costs_warprnnt_tf, [log_probs_t])[0]
+    costs_warprnnt, grads_warprnnt = sess.run([costs_warprnnt_tf, grads_warprnnt_tf])
+    return ComputationResult(costs=-costs_warprnnt, grads=grads_warprnnt)
+
+
 def test_impl(name, acts, labels, blank_index, input_lens=None, label_lens=None,
               timing=False, debug=False):
   """
@@ -421,80 +482,45 @@ def test_impl(name, acts, labels, blank_index, input_lens=None, label_lens=None,
   n_batch, n_time, n_target, n_vocab = acts.shape
   log_probs = log_softmax(acts, axis=-1)  # along vocabulary
 
-  def print_results(name, cost, grads):
+  def print_results(name, result: ComputationResult):
     """Prints the results of an implementation."""
-    cost = sum(cost)
-    if grads is None:
+    cost = sum(result.costs)
+    if result.grads is None:
       grads_msg = "n/a"
     else:
-      grads_msg = "%.3f" % np.linalg.norm(grads)
+      grads_msg = "%.3f" % np.linalg.norm(result.grads)
     print(colored("%20s" % name, "red"),
           "implementation: log-posterior=%.3f, |grads|=%s" % (
             cost,  grads_msg))
   print("Test", colored("%s" % name, "yellow"))
 
-  list_ll = []
-  list_grads = []
-  grads_ref = None
-  for i in range(n_batch):
-    cost_ref, grads_ref = transduce_ref(log_probs[i, :input_lens[i] + 1, :label_lens[i] + 1], labels[i, :label_lens[i]],
-                                        blank=blank_index)
-    list_ll.append(-cost_ref)
-    list_grads.append(grads_ref)
-  costs_ref = np.stack(list_ll, axis=0)
-  print_results("Reference", costs_ref, grads_ref)
+  result_ref = wrap_ref_rnnt(log_probs, labels, input_lens, label_lens, blank_index)
+  print_results("Reference", result_ref)
 
-  costs_np = numpy_forward_shifted_batched(log_probs, labels, blank_index=blank_index,
-                                           input_lens=input_lens, label_lens=label_lens,
-                                           debug=debug)
-  # print_results("Numpy", costs_np, np.zeros_like(grads_ref))
-  np.testing.assert_almost_equal(costs_np, costs_ref, decimal=5)
-  print_results("Numpy shifted", costs_np, None)
+  result_numpy_batched = numpy_forward_shifted_batched(log_probs, labels, blank_index=blank_index,
+                                                       input_lens=input_lens, label_lens=label_lens,
+                                                       debug=debug)
+  print_results("Numpy batched", result_numpy_batched)
 
-  with sess.as_default():
-    input_lengths_t = tf.constant(input_lens, dtype=tf.int32)  # (B,)
-    label_lengths_t = tf.constant(label_lens, dtype=tf.int32)  # (B,)
-    log_probs_t = tf.constant(log_probs, dtype=tf.float32)  # (B, T, U, V)
-    labels_t = tf.constant(labels, dtype=tf.int32)
-    costs_warprnnt_tf = rnnt_loss(log_probs_t, labels_t,
-                                  input_lengths_t, label_lengths_t, blank_label=blank_index)
-    grads_warprnnt_tf = tf.gradients(costs_warprnnt_tf, [log_probs_t])[0]
-    costs_warprnnt, grads_warprnnt = sess.run([costs_warprnnt_tf, grads_warprnnt_tf])
-    costs_warprnnt = -costs_warprnnt
+  result_warp = wrap_warp_rnnt(log_probs, labels, input_lens, label_lens, blank_index)
+  print_results("Warp reference", result_warp)
 
-    print_results("Warp reference", costs_warprnnt, grads_warprnnt)
-
-  with sess.as_default():
-    labels_ph = tf.compat.v1.placeholder(tf.int32, [None, None])
-    log_probs_ph = tf.compat.v1.placeholder(tf.float32, [None, None, None, None])
-    input_lengths_ph = tf.compat.v1.placeholder(tf.int32, [None])
-    label_lengths_ph = tf.compat.v1.placeholder(tf.int32, [None])
-
-    costs_ph = tf_forward_shifted(log_probs_ph, labels_ph,
-                                  input_lengths=input_lengths_ph,
-                                  label_lengths=label_lengths_ph,
-                                  blank_index=blank_index, debug=debug)
-    grads_ph = tf.gradients(xs=log_probs_ph, ys=[-costs_ph])[0]
-    costs_tf, grads_tf = sess.run([costs_ph, grads_ph],
-                                  feed_dict={log_probs_ph: log_probs,
-                                             labels_ph: labels,
-                                             input_lengths_ph: input_lens,
-                                             label_lengths_ph: label_lens})
-  print_results("Tensorflow", costs_tf, grads_tf)
+  result_tf = wrap_tf_rnnt(log_probs, labels, input_lens, label_lens, blank_index, debug)
+  print_results("Tensorflow", result_tf)
 
   # Do all the tests (ref vs TF), for score, and grads (TF/Ref)
   # We don't have an alpha-matrix anymore (instead there are diagonals)
-  np.testing.assert_almost_equal(costs_warprnnt, costs_ref, decimal=5)
+  np.testing.assert_almost_equal(result_warp.costs, result_ref.costs, decimal=5)
   print("Warp vs Reference: log posterior", colored("MATCH", "green"))
   for i in range(n_batch):
-    np.testing.assert_almost_equal(grads_warprnnt[i], list_grads[i], decimal=5)
+    np.testing.assert_almost_equal(result_warp.grads[i], result_ref.grads[i], decimal=5)
   print("Warp vs Reference: gradients    ", colored("MATCH", "green"))
-  np.testing.assert_almost_equal(costs_tf, costs_warprnnt, decimal=5)
+  np.testing.assert_almost_equal(result_tf.costs, result_warp.costs, decimal=5)
   print("TF vs Warp: log posterior       ", colored("MATCH", "green"))
-  np.testing.assert_almost_equal(grads_tf, grads_warprnnt, decimal=4)
+  np.testing.assert_almost_equal(result_tf.grads, result_warp.grads, decimal=4)
   print("TF vs Warp: gradients           ", colored("MATCH", "green"))
   print()
-  return costs_tf, grads_tf
+  return result_tf.costs, result_tf.grads
 
 
 def test_small():
