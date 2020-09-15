@@ -18,11 +18,21 @@ NEG_INF = -float("inf")
 class ComputationResult(object):
   """Represents the information about the computation result,
   for a comparison across the implementations."""
-  def __init__(self, costs=None, alphas=None, alignments=None, grads=None):
+  def __init__(self, name, costs=None, alphas=None, alignments=None, grads=None):
+    self.name = name
     self.costs = costs
     self.alphas = alphas
     self.alignments = alignments
     self.grads = grads
+
+  def __repr__(self):
+    cost = sum(self.costs)
+    if self.grads is None:
+      grads_msg = "n/a"
+    else:
+      grads_msg = "%.3f" % np.linalg.norm(self.grads)
+    ret = "%20s implementation: log-posterior=%.3f, |grads|=%s" % (colored("%20s" % self.name, "red"), cost, grads_msg)
+    return ret
 
 
 def logsumexp(*args):  # summation in linear space -> LSE in log-space
@@ -207,7 +217,7 @@ def numpy_forward_shifted_batched(log_probs, labels, blank_index, input_lens, la
       print("FINAL i=%d" % i, "a=%.3f + b=%.3f" % (a, b))
     nll = a + b
     list_nll.append(nll)
-  return ComputationResult(costs=np.array(list_nll))
+  return ComputationResult("NumPy Batched", costs=np.array(list_nll))
 
 
 def tf_shift_logprobs(mat, axis):
@@ -420,7 +430,7 @@ def wrap_tf_rnnt(log_probs, labels, input_lengths=None, label_lengths=None,
                                                labels_ph: labels,
                                                input_lengths_ph: input_lengths,
                                                label_lengths_ph: label_lengths})
-      return ComputationResult(costs=costs_tf, grads=grads_tf)
+      return ComputationResult("Pure Tensorflow", costs=costs_tf, grads=grads_tf)
 
 
 def wrap_ref_rnnt(log_probs, labels, input_lens, label_lens, blank_index) -> ComputationResult:
@@ -436,7 +446,7 @@ def wrap_ref_rnnt(log_probs, labels, input_lens, label_lens, blank_index) -> Com
     list_grads.append(grads_ref)
   costs_ref = np.stack(list_ll, axis=0)
   grads_ref = np.stack(list_grads, axis=0)
-  return ComputationResult(costs=costs_ref, grads=grads_ref)
+  return ComputationResult("Reference", costs=costs_ref, grads=grads_ref)
 
 
 def wrap_warp_rnnt(log_probs, labels, input_lens, label_lens, blank_index) -> ComputationResult:
@@ -449,7 +459,7 @@ def wrap_warp_rnnt(log_probs, labels, input_lens, label_lens, blank_index) -> Co
                                   input_lengths_t, label_lengths_t, blank_label=blank_index)
     grads_warprnnt_tf = tf.gradients(costs_warprnnt_tf, [log_probs_t])[0]
     costs_warprnnt, grads_warprnnt = sess.run([costs_warprnnt_tf, grads_warprnnt_tf])
-    return ComputationResult(costs=-costs_warprnnt, grads=grads_warprnnt)
+    return ComputationResult("Warp Tensorflow", costs=-costs_warprnnt, grads=grads_warprnnt)
 
 
 def test_impl(name, acts, labels, blank_index, input_lens=None, label_lens=None,
@@ -482,31 +492,21 @@ def test_impl(name, acts, labels, blank_index, input_lens=None, label_lens=None,
   n_batch, n_time, n_target, n_vocab = acts.shape
   log_probs = log_softmax(acts, axis=-1)  # along vocabulary
 
-  def print_results(name, result: ComputationResult):
-    """Prints the results of an implementation."""
-    cost = sum(result.costs)
-    if result.grads is None:
-      grads_msg = "n/a"
-    else:
-      grads_msg = "%.3f" % np.linalg.norm(result.grads)
-    print(colored("%20s" % name, "red"),
-          "implementation: log-posterior=%.3f, |grads|=%s" % (
-            cost,  grads_msg))
   print("Test", colored("%s" % name, "yellow"))
 
   result_ref = wrap_ref_rnnt(log_probs, labels, input_lens, label_lens, blank_index)
-  print_results("Reference", result_ref)
+  print(result_ref)
 
   result_numpy_batched = numpy_forward_shifted_batched(log_probs, labels, blank_index=blank_index,
                                                        input_lens=input_lens, label_lens=label_lens,
                                                        debug=debug)
-  print_results("Numpy batched", result_numpy_batched)
+  print(result_numpy_batched)
 
   result_warp = wrap_warp_rnnt(log_probs, labels, input_lens, label_lens, blank_index)
-  print_results("Warp reference", result_warp)
+  print(result_warp)
 
   result_tf = wrap_tf_rnnt(log_probs, labels, input_lens, label_lens, blank_index, debug)
-  print_results("Tensorflow", result_tf)
+  print(result_tf)
 
   # Do all the tests (ref vs TF), for score, and grads (TF/Ref)
   # We don't have an alpha-matrix anymore (instead there are diagonals)
