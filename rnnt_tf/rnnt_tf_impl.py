@@ -33,7 +33,11 @@ class ComputationResult(object):
     if self.grads is None:
       grads_msg = "n/a"
     else:
-      grads_msg = "%.3f" % np.linalg.norm(self.grads)
+      grads = self.grads
+      if isinstance(grads, np.ndarray):
+        if len(grads.shape) == 4:
+          *grads, = grads  # list[np.ndarray]
+      grads_msg = "%.4f" % sum([np.linalg.norm(grad) for grad in grads])
     ret = "%20s implementation: log-posterior=%.3f, |grads|=%s" % (colored("%20s" % self.name, "red"), cost, grads_msg)
     if self.alignments is not None:
       ret += " alignment[0]=%r" % self.alignments[0]
