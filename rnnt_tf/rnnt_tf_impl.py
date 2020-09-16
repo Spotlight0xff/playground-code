@@ -4,8 +4,11 @@
 Implementation of the RNN-T loss in pure TF,
 plus comparisons against reference implementations.
 """
+import math
 import os
 import sys
+from abc import abstractmethod
+
 import numpy as np
 from termcolor import colored
 from ref_transduce import transduce as transduce_ref
@@ -26,12 +29,14 @@ class ComputationResult(object):
     self.grads = grads
 
   def __repr__(self):
-    cost = sum(self.costs)
+    cost = sum(self.costs) if isinstance(self.costs, (list, np.ndarray)) else self.costs
     if self.grads is None:
       grads_msg = "n/a"
     else:
       grads_msg = "%.3f" % np.linalg.norm(self.grads)
     ret = "%20s implementation: log-posterior=%.3f, |grads|=%s" % (colored("%20s" % self.name, "red"), cost, grads_msg)
+    if self.alignments is not None:
+      ret += " alignment[0]=%r" % self.alignments[0]
     return ret
 
 
@@ -56,6 +61,68 @@ def log_softmax(acts, axis=None):
   return log_probs
 
 
+class Semiring:
+  @property
+  @abstractmethod
+  def zero(self):
+    raise NotImplementedError
+
+  @property
+  @abstractmethod
+  def one(self):
+    raise NotImplementedError
+
+  @staticmethod
+  @abstractmethod
+  def mul(*args):
+    raise NotImplementedError
+
+  @staticmethod
+  @abstractmethod
+  def add(*args):
+    raise NotImplementedError
+
+
+class LogSemiring(Semiring):
+  """
+  Actually negated log semiring.
+  More numerically stable than `class:ProbabilitySemiring`.
+  """
+  @property
+  def zero(self):
+    return math.inf
+
+  @property
+  def one(self):
+    return 0.
+
+  @staticmethod
+  def mul(*args):
+    return math.fsum(args)
+
+  @staticmethod
+  def add(*args):
+    return logsumexp(*args)
+    # if math.isinf(x) and math.isinf(y):
+    #   return math.inf
+    # if math.isinf(x):
+    #   return y
+    # if math.isinf(y):
+    #   return x
+    # return min(x, y) - math.log(1 + math.exp(-abs(x-y)))
+
+
+class TropicalSemiring(LogSemiring):
+  """
+  Same as `class:LogSemiring`, expect that we use Viterbi approximation for summation.
+  This is used to implement the search for the best path.
+  """
+  @staticmethod
+  def add(*args):
+    # return min(args)
+    return max(args)
+
+
 def py_print_iteration_info(msg, var, n, debug=True):
   """adds a tf.print op to the graph while ensuring it will run (when the output is used)."""
   if not debug:
@@ -67,41 +134,69 @@ def py_print_iteration_info(msg, var, n, debug=True):
   return var
 
 
-def numpy_forward(log_probs, labels, blank_index, debug=False) -> ComputationResult:
+def numpy_forward(log_probs, labels, blank_index, debug=False, with_alignment=False,
+                  semiring=LogSemiring) -> ComputationResult:
   """Forward calculation of the RNN-T loss."""
   n_time, n_target, n_vocab = log_probs.shape
   alpha = np.zeros((n_time, n_target))  # 1 in log-space
-  print("a = alpha[t-1, u] + log_probs[t - 1, u, blank_index]")
-  print("b = alpha[t, u - 1] + log_probs[t, u - 1, labels[u - 1]]")
-  print("alpha[t,u] = LSE(a,b)")
   if debug:
-    print("U=%d, T=%d, V=%d" % (n_target, n_time, n_vocab))
+    print("Numpy RNN-T loss computation, with-alignment: %r" % with_alignment)
+    print("a = alpha[t-1, u] + log_probs[t - 1, u, blank_index]")
+    print("b = alpha[t, u - 1] + log_probs[t, u - 1, labels[u - 1]]")
+    print("alpha[t,u] = LSE(a,b)")
+  # backtrace matrix for (U+T) -> U, storing in each cell (from_t, from_u, symbol)
+  if with_alignment:
+    bt_mat = np.zeros((n_time, n_target, 3), dtype=np.int32)
+
+  if debug:
+    print("T=%d, U=%d, V=%d" % (n_time, n_target, n_vocab))
+    print("labels:", labels, "blank-index:", blank_index)
   for t in range(1, n_time):  # first row
     alpha[t, 0] = alpha[t - 1, 0] + log_probs[t - 1, 0, blank_index]
-    print('t=%2d u= 0: alpha[%d, 0] + log_probs[%d, 0, %d] = %.3f + %.3f = %.3f' % (
-      t, t-1, t-1, blank_index, alpha[t - 1, 0], log_probs[t - 1, 0, blank_index], alpha[t, 0]))
+    if with_alignment:
+      bt_mat[t, 0] = (t-1, 0, blank_index)  # noqa  can only be blank
+    if debug:
+      print('t=%2d u= 0: alpha[%d, 0] + log_probs[%d, 0, %d] = %.3f + %.3f = %.3f' % (
+        t, t-1, t-1, blank_index, alpha[t - 1, 0], log_probs[t - 1, 0, blank_index], alpha[t, 0]))
   for u in range(1, n_target):  # first column
     alpha[0, u] = alpha[0, u - 1] + log_probs[0, u - 1, labels[u - 1]]
-    print('t= 0 u=%2d: alpha[0, %d] + log_probs[0, %d, labels[%d]=%d] = %.3f + %.3f = %.3f' % (
-      u, u-1, u-1, u-1, labels[u - 1], alpha[0, u - 1], log_probs[0, u - 1, labels[u - 1]], alpha[0, u]))
+    if with_alignment:
+      bt_mat[0, u] = (0, u-1, labels[u-1])  # can only be emit
+    if debug:
+      print('t= 0 u=%2d: alpha[0, %d] + log_probs[0, %d, labels[%d]=%d] = %.3f + %.3f = %.3f' % (
+        u, u-1, u-1, u-1, labels[u - 1], alpha[0, u - 1], log_probs[0, u - 1, labels[u - 1]], alpha[0, u]))
 
   for t in range(1, n_time):
     for u in range(1, n_target):
       a = alpha[t - 1, u] + log_probs[t - 1, u, blank_index]
       b = alpha[t, u - 1] + log_probs[t, u - 1, labels[u - 1]]
-      alpha[t, u] = elem = logsumexp(a, b)  # addition in linear-space -> LSE in log-space
-      print('t=%2d u=%2d: LSE(%.3f + %.3f, %.3f +  %.3f) = LSE(%.3f, %.3f) = %.3f' % (t, u,
-                                                                                      alpha[t - 1, u],
-                                                                                      log_probs[t - 1, u, blank_index],
-                                                                                      alpha[t, u - 1],
-                                                                                      log_probs[
-                                                                                        t, u - 1, labels[u - 1]],
-                                                                                      a, b, elem))
+      alpha[t, u] = elem = semiring.add(a, b)
+      # alpha[t, u] = elem = logsumexp(a, b)  # addition in linear-space -> LSE in log-space
+      if with_alignment:
+        from_idx = np.argmax([a, b])
+        if from_idx == 0:  # blank
+          bt_mat[t, u] = (t-1, u, blank_index)
+        elif from_idx == 1:  # emit
+          bt_mat[t, u] = (t, u-1, labels[u-1])
+      if debug:
+        print('t=%2d u=%2d: LSE(%.3f + %.3f, %.3f +  %.3f) = LSE(%.3f, %.3f) = %.3f' % (t, u,
+                                                                                        alpha[t - 1, u],
+                                                                                        log_probs[t - 1, u, blank_index],
+                                                                                        alpha[t, u - 1],
+                                                                                        log_probs[
+                                                                                          t, u - 1, labels[u - 1]],
+                                                                                        a, b, elem))
 
   if debug:
     assert len(alpha.shape) == 2
     print("Alpha matrix: (%d, %d)" % tuple(alpha.shape))
     print(alpha)
+  alignment = None
+  if with_alignment:
+    alignment_batched = backtrack_alignment_rnnt_numpy_batched(bt_mat[np.newaxis], input_lens=np.array([n_time]),
+                                                               label_lens=np.array([n_target]), blank_index=blank_index)
+    alignment = backtrack_alignment_rnnt_numpy(bt_mat, n_time=n_time, n_target=n_target, blank_index=blank_index)
+    np.testing.assert_equal(alignment, alignment_batched[0])
   log_posterior = alpha[n_time-1, n_target-1] + log_probs[n_time-1, n_target-1, blank_index]
   if debug:
     print("log-posterior = alpha[%d, %d] + log_probs[%d, %d, %d] = %.3f + %.3f = %.4f" %
@@ -110,10 +205,83 @@ def numpy_forward(log_probs, labels, blank_index, debug=False) -> ComputationRes
            log_probs[n_time - 1, n_target - 1, blank_index],
            log_posterior
            ))
-  return alpha, log_posterior
+  return ComputationResult("numpy forward", costs=log_posterior, alphas=alpha, alignments=alignment, grads=None)
 
 
-def numpy_forward_shifted_batched(log_probs, labels, blank_index, input_lens, label_lens, debug=False):
+def backtrack_alignment_rnnt_numpy(bt_mat, n_time, n_target, blank_index):
+  """Computes the alignment from the backtracking matrix.
+  We do this in a batched fashion so we can compare/copy this directly to TF.
+
+  :param bt_mat: backtracking matrix (T, U+1, 3)
+  :param n_time: scalar
+  :param n_time: scalar
+  :param blank_index:
+
+  :return alignment of form (B, T+U) -> [V]
+  :rtype np.ndarray
+  """
+  assert len(bt_mat.shape) == 3
+  assert bt_mat.shape == (n_time, n_target, 3)
+  # (B, T+U+1) -> [V]
+  # alignments[:, 0] should be blank, because in RNN-T we initially consume a frame, then we can emit.
+  # alignments = np.ones((n_batch, max_time+max_target), dtype=np.int32) * blank_index
+  init_t, init_u = n_time-1, n_target-1
+  idx = bt_mat[init_t, init_u]  # (from_t, from_u, symbol)
+  alignments = [idx[2]]
+  print("bt-mat:", bt_mat.shape)
+  print("bt-mat[%r, %r] = intial-idx = %r" % (init_t, init_u, idx))
+  for s in reversed(range(1, n_time + n_target-1)):  # every path is T+U long.
+    assert idx.shape == (3,)
+    t = idx[0]  # time
+    u = idx[1]  # target
+    print("[np] s=%2d | t=%2d u=%2d, idx=" % (s, t, u), idx)
+    idx = bt_mat[t, u]
+    alignments.insert(0, idx[2])
+    # We backtrack from the end, but the end may be different for each seq in the batch.
+    # Thus we need to ensure that we start at the correct end-point for each seq.
+  # alignments.insert(0, idx[2])
+  return np.array(alignments)
+
+
+def backtrack_alignment_rnnt_numpy_batched(bt_mat, input_lens, label_lens, blank_index):
+  """Computes the alignment from the backtracking matrix.
+  We do this in a batched fashion so we can compare/copy this directly to TF.
+
+  :param bt_mat: backtracking matrix (B, T, U+1, 3)
+  :param input_lens: (B,)
+  :param label_lens: (B,)
+  :param blank_index:
+
+  :return alignment of form (B, T+U) -> [V]
+  :rtype np.ndarray
+  """
+  assert input_lens.shape == label_lens.shape
+  n_batch, max_time, max_target, track_dim = bt_mat.shape
+  assert track_dim == 3  # (from_t, from_u, label)
+  # (B, T+U+1) -> [V]
+  # alignments[:, 0] should be blank, because in RNN-T we initially consume a frame, then we can emit.
+  alignments = np.ones((n_batch, max_time+max_target-1), dtype=np.int32) * blank_index
+  idx = bt_mat[np.arange(n_batch), input_lens-1, label_lens-1]
+  initial_idx = idx
+  print("bt-mat:", bt_mat.shape)
+  # print("[np batched] initial-idx (i=%1d)=%r" % (0, idx))
+  for s in reversed(range(1, max_time + max_target-1)):  # every path is T+U long.
+    assert idx.shape == (n_batch, 3)
+    alignments[:, s] = np.where(s < input_lens+label_lens-1, idx[:, 2], -1)
+    t = idx[:, 0]  # time
+    u = idx[:, 1]  # target
+    # print("[np batched] s=%2d | t=%2d u=%2d, idx=" % (s, t, u), idx)
+    idx = bt_mat[np.arange(n_batch), t, u]  # (B,)
+    cond = (s >= input_lens+label_lens - 1)[:, np.newaxis]
+    # print(s, input_lens+label_lens-1, cond)
+    # We backtrack from the end, but the end may be different for each seq in the batch.
+    # Thus we need to ensure that we start at the correct end-point for each seq.
+    idx = np.where(cond, initial_idx, idx)
+  return alignments
+
+
+def numpy_forward_shifted_batched(log_probs, labels, blank_index, input_lens, label_lens, debug=False,
+                                  with_alignment=False):
   """Forward calculation of the RNN-T loss using the same diagonal strategy."""
   n_batch, max_time, max_target, n_vocab = log_probs.shape  # (B, T, U+1, V)
   assert labels.shape == (n_batch, max_target-1)  # (B, U)
@@ -122,6 +290,9 @@ def numpy_forward_shifted_batched(log_probs, labels, blank_index, input_lens, la
     print("log-probs: (B=%d, T=%d, U=%d, V=%d)" % (n_batch, max_time, max_target, n_vocab))
     print("labels: (B=%d, U-1=%d)" % (n_batch, labels.shape[1]))
   num_diagonals = max_time + max_target
+
+  # backtrack matrix, (i, t, u) -> [from_t, from_u, symbol/blank]
+  bt_mat = np.zeros((n_batch, max_time, max_target, 3), dtype=np.int32)
 
   with tf.Session().as_default():
     tf_shifted = tf_shift_logprobs(tf.cast(tf.transpose(log_probs, [0, 2, 1, 3]), dtype=tf.float32), axis=1)
@@ -193,6 +364,15 @@ def numpy_forward_shifted_batched(log_probs, labels, blank_index, input_lens, la
     y = alpha_y + lp_y
     print_debug(n, colored("y", "red"), y)
     new_diagonal = np.logaddexp(blank, y)  # (B, N)
+
+    argmax_idx = np.argmax([blank, y], axis=0)[:, :n]  # (B, N) -> [2], 0: blank, 1: emit
+    print_debug(n, colored("argmax-idx", "cyan"), argmax_idx)
+
+    # best_sel = np.where(argmax_idx == 0,
+    #                     (t-1, u, blank_index),  # blank
+    #                     (t, u-1, labels[u-1])   # emit
+    #                     )
+    # bt_mat[:, n-1, :n] = best_sel
 
     new_diagonal = new_diagonal[:, :n]
     print_debug(n, "new_diagonal", new_diagonal)
@@ -449,6 +629,22 @@ def wrap_ref_rnnt(log_probs, labels, input_lens, label_lens, blank_index) -> Com
   return ComputationResult("Reference", costs=costs_ref, grads=grads_ref)
 
 
+def wrap_numpy_rnnt(log_probs, labels, input_lens, label_lens, blank_index, debug=True,
+                    with_alignment=False) -> ComputationResult:
+  """Wraps the numpy debug implementation in our format for comparison."""
+  list_costs = []
+  list_alignments = []
+  n_batch = log_probs.shape[0]
+  for i in range(n_batch):
+    result = numpy_forward(log_probs[i, :input_lens[i] + 1, :label_lens[i] + 1], labels[i, :label_lens[i]],
+                           blank_index=blank_index, debug=debug, with_alignment=with_alignment)
+    list_costs.append(result.costs)
+    list_alignments.append(result.alignments)
+  costs = np.stack(list_costs, axis=0)
+  alignments = np.stack(list_alignments, axis=0) if with_alignment else None
+  return ComputationResult("Numpy", costs=costs, alignments=alignments)
+
+
 def wrap_warp_rnnt(log_probs, labels, input_lens, label_lens, blank_index) -> ComputationResult:
   with sess.as_default():
     input_lengths_t = tf.constant(input_lens, dtype=tf.int32)  # (B,)
@@ -463,7 +659,7 @@ def wrap_warp_rnnt(log_probs, labels, input_lens, label_lens, blank_index) -> Co
 
 
 def test_impl(name, acts, labels, blank_index, input_lens=None, label_lens=None,
-              timing=False, debug=False):
+              timing=False, debug=False, with_alignment=False):
   """
   runs the different implementations on the same data, comparing them.
 
@@ -497,6 +693,10 @@ def test_impl(name, acts, labels, blank_index, input_lens=None, label_lens=None,
   result_ref = wrap_ref_rnnt(log_probs, labels, input_lens, label_lens, blank_index)
   print(result_ref)
 
+  if with_alignment:
+    result_numpy = wrap_numpy_rnnt(log_probs, labels, input_lens, label_lens, blank_index, debug, with_alignment)
+    print(result_numpy)
+
   result_numpy_batched = numpy_forward_shifted_batched(log_probs, labels, blank_index=blank_index,
                                                        input_lens=input_lens, label_lens=label_lens,
                                                        debug=debug)
@@ -521,6 +721,71 @@ def test_impl(name, acts, labels, blank_index, input_lens=None, label_lens=None,
   print("TF vs Warp: gradients           ", colored("MATCH", "green"))
   print()
   return result_tf.costs, result_tf.grads
+
+
+def test_alignment():
+  """Small test, copied from
+    https://github.com/awni/transducer/blob/master/ref_transduce.py
+  """
+  blank_index = 0
+  n_time = 2
+  n_target = 3
+  n_vocab = 5
+  acts = np.array([0.1, 0.5, 0.3, 0.2, 0.1, 0.2,
+                   0.1, 0.4, 0.2, 0.2, 0.1, 0.1,
+                   0.2, 0.4, 0.1, 0.3, 0.6, 0.3,
+                   0.2, 0.1, 0.05, 0.1, 0.2, 0.1,
+                   0.1, 0.7, 0.1, 0.2, 0.1, 0.4], dtype=np.float32).reshape((n_time, n_target, n_vocab))
+
+  labels = np.array([1, 2])
+  test_impl("test_alignment", acts, labels, blank_index, debug=True, with_alignment=True)
+
+
+def test_alignment_score(seed):
+  """
+  In addition to comparing the alignments themselves (Numpy vs TF),
+  we also compute the score of the best path (per alignment) which be the same
+  score as when we take the tropical semiring for the loss computation.
+  :return:
+  """
+  n_time = 20
+  n_target = 8
+  n_vocab = 5
+  blank_index = 0
+  np.random.seed(seed)
+  print("seed", seed)
+  acts = np.random.random((n_time, n_target+1, n_vocab))
+  labels = np.random.randint(1, n_vocab, size=(n_target,))
+  print("labels", labels.tolist())
+  log_probs = log_softmax(acts, axis=-1)
+  result = numpy_forward(log_probs, labels, blank_index=blank_index, debug=False, with_alignment=True,
+                         semiring=LogSemiring)
+  print("Alignment", result.alignments, "(len %r)" % len(result.alignments))
+  nonzero_alignment = result.alignments[result.alignments != blank_index]
+  np.testing.assert_equal(nonzero_alignment, labels)
+  t = u = 0
+  elems = []
+  # elems.append(log_probs[0, 0, blank_index])
+  for i, symbol in enumerate(result.alignments[1:]):
+    if symbol == blank_index:
+      t += 1
+      elems.append(log_probs[t-1, u, blank_index])
+    else:
+      u += 1
+      elems.append(log_probs[t, u-1, labels[u-1]])
+  # elems.append(log_probs[-1, -1, blank_index])
+  # assert t+u == n_time + n_target
+  print(len(elems), t+u, elems)
+  score = sum(elems)
+  print("Alignment score:", score)
+
+  result_tropical = numpy_forward(log_probs, labels, blank_index=blank_index, debug=False, with_alignment=False,
+                                  semiring=TropicalSemiring)
+  print("Tropical score :", result_tropical.costs)
+
+  print("Log      score :", result.costs)
+  score_ref = transduce_ref(log_probs, labels, blank=blank_index)
+  print("Reference score:", -score_ref[0])
 
 
 def test_small():
@@ -593,9 +858,9 @@ def test_blank_idx_nonzero():
   n_vocab = 5
   acts = np.random.standard_normal((n_time, n_target, n_vocab))
   labels = np.array([1, 2])
-  blank_index = 2
-  #for blank_index in range(n_vocab):
-  test_impl("test_blank_idx (%d)" % blank_index, acts, labels, blank_index=blank_index)
+  # blank_index = 2  # this test breaks when we have a blank_index which is within the labels (e.g. 1 or 2)
+  for blank_index in range(3, n_vocab):
+    test_impl("test_blank_idx (%d)" % blank_index, acts, labels, blank_index=blank_index)
 
 
 def test_batched():
@@ -695,13 +960,20 @@ def test_batched():
 if __name__ == '__main__':
   tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.ERROR)
   sess = tf.Session()
+  from returnn.tf.util.basic import setup_tf_thread_pools
+  setup_tf_thread_pools(1, log_file=None, tf_session_opts={})
   import better_exchook
   better_exchook.install()
 
-  test_small()
-  test_size_u_greater_t()
-  test_size_t_greater_u()
-  test_size_t_equal_u()
-  #test_blank_idx_nonzero()  # TODO: wrong!!
-  test_batched()
-  test_sizes()
+  # test_alignment()
+  # for seed in range(42):
+  #   test_alignment_score(seed)
+  # test_alignment_score(7)
+  test_alignment_batched()
+  # test_small()
+  # test_size_u_greater_t()
+  # test_size_t_greater_u()
+  # test_size_t_equal_u()
+  # test_blank_idx_nonzero()
+  # test_batched()
+  # test_sizes()
