@@ -193,10 +193,10 @@ def numpy_forward(log_probs, labels, blank_index, debug=False, with_alignment=Fa
     print(alpha)
   alignment = None
   if with_alignment:
-    alignment_batched = backtrack_alignment_rnnt_numpy_batched(bt_mat[np.newaxis], input_lens=np.array([n_time]),
-                                                               label_lens=np.array([n_target]), blank_index=blank_index)
+    # alignment_batched = backtrack_alignment_rnnt_numpy_batched(bt_mat[np.newaxis], input_lens=np.array([n_time]),
+    #                                                            label_lens=np.array([n_target]), blank_index=blank_index)
     alignment = backtrack_alignment_rnnt_numpy(bt_mat, n_time=n_time, n_target=n_target, blank_index=blank_index)
-    np.testing.assert_equal(alignment, alignment_batched[0])
+    # np.testing.assert_equal(alignment, alignment_batched[0])
   log_posterior = alpha[n_time-1, n_target-1] + log_probs[n_time-1, n_target-1, blank_index]
   if debug:
     print("log-posterior = alpha[%d, %d] + log_probs[%d, %d, %d] = %.3f + %.3f = %.4f" %
@@ -247,7 +247,7 @@ def backtrack_alignment_rnnt_numpy_batched(bt_mat, input_lens, label_lens, blank
   """Computes the alignment from the backtracking matrix.
   We do this in a batched fashion so we can compare/copy this directly to TF.
 
-  :param bt_mat: backtracking matrix (B, T, U+1, 3)
+  :param bt_mat: backtracking matrix (T+U+1, B, U, 3)
   :param input_lens: (B,)
   :param label_lens: (B,)
   :param blank_index:
@@ -255,28 +255,30 @@ def backtrack_alignment_rnnt_numpy_batched(bt_mat, input_lens, label_lens, blank
   :return alignment of form (B, T+U) -> [V]
   :rtype np.ndarray
   """
-  assert input_lens.shape == label_lens.shape
-  n_batch, max_time, max_target, track_dim = bt_mat.shape
-  assert track_dim == 3  # (from_t, from_u, label)
+  assert len(input_lens) == len(label_lens)
+  max_path, n_batch, max_target, track_dim = bt_mat.shape
+  assert track_dim == 2  # (from_u, label)
   # (B, T+U+1) -> [V]
   # alignments[:, 0] should be blank, because in RNN-T we initially consume a frame, then we can emit.
-  alignments = np.ones((n_batch, max_time+max_target-1), dtype=np.int32) * blank_index
-  idx = bt_mat[np.arange(n_batch), input_lens-1, label_lens-1]
-  initial_idx = idx
+  alignments = np.ones((n_batch, max_path), dtype=np.int32) * 0 #blank_index
+  print("#diagonals:", max_path, "B=%r" % n_batch, "U=%r" % max_target, "D=%r" % track_dim)
   print("bt-mat:", bt_mat.shape)
-  # print("[np batched] initial-idx (i=%1d)=%r" % (0, idx))
-  for s in reversed(range(1, max_time + max_target-1)):  # every path is T+U long.
-    assert idx.shape == (n_batch, 3)
-    alignments[:, s] = np.where(s < input_lens+label_lens-1, idx[:, 2], -1)
-    t = idx[:, 0]  # time
-    u = idx[:, 1]  # target
-    # print("[np batched] s=%2d | t=%2d u=%2d, idx=" % (s, t, u), idx)
-    idx = bt_mat[np.arange(n_batch), t, u]  # (B,)
-    cond = (s >= input_lens+label_lens - 1)[:, np.newaxis]
-    # print(s, input_lens+label_lens-1, cond)
-    # We backtrack from the end, but the end may be different for each seq in the batch.
-    # Thus we need to ensure that we start at the correct end-point for each seq.
-    idx = np.where(cond, initial_idx, idx)
+  idx = bt_mat[max_path-1, :, -2]  # (2,)  # we don't actually use this.
+  assert bt_mat.shape[0] == max_path
+  for s in reversed(range(1, max_path)):  # every path is T+U long.
+    cond = np.greater_equal(s, input_lens+label_lens-1)
+    init_u = np.where(cond,
+                      label_lens,  # if we are at the end of some path (or behind)
+                      idx[:, 0]  # if we are within a path, continue backtracking.
+                      )
+    assert init_u.shape == (n_batch,)
+    idx = bt_mat[s, np.arange(n_batch), init_u]
+    assert idx.shape == (n_batch, 2), init_u.shape
+    write_align = np.where(s <= input_lens+label_lens, idx[:, 1], -1)
+    print("s=%r, cond=%r" % (s, cond.tolist()[0]))
+    print("s=%r, init-u=%r, idx=%r, align=%r" % (s, init_u[0], idx[0].tolist(), write_align[0].tolist()))
+    print("s=%r, bt_mat:" % s, bt_mat[s])
+    alignments[:, s-1] = write_align  # [B]
   return alignments
 
 
@@ -291,8 +293,10 @@ def numpy_forward_shifted_batched(log_probs, labels, blank_index, input_lens, la
     print("labels: (B=%d, U-1=%d)" % (n_batch, labels.shape[1]))
   num_diagonals = max_time + max_target
 
-  # backtrack matrix, (i, t, u) -> [from_t, from_u, symbol/blank]
-  bt_mat = np.zeros((n_batch, max_time, max_target, 3), dtype=np.int32)
+  # backtrack matrix, (s, i, u) -> [from_u, symbol/blank]
+  bt_mat = np.zeros((max_time+max_target-1, n_batch, max_target, 2), dtype=np.int32)
+  # bt_mat: (T+U+1, B, U, 2), same form as `shifted_logprobs`.
+  # then simply bt_mat[n] =
 
   with tf.Session().as_default():
     tf_shifted = tf_shift_logprobs(tf.cast(tf.transpose(log_probs, [0, 2, 1, 3]), dtype=tf.float32), axis=1)
@@ -364,19 +368,43 @@ def numpy_forward_shifted_batched(log_probs, labels, blank_index, input_lens, la
     y = alpha_y + lp_y
     print_debug(n, colored("y", "red"), y)
     new_diagonal = np.logaddexp(blank, y)  # (B, N)
-
-    argmax_idx = np.argmax([blank, y], axis=0)[:, :n]  # (B, N) -> [2], 0: blank, 1: emit
-    print_debug(n, colored("argmax-idx", "cyan"), argmax_idx)
-
-    # best_sel = np.where(argmax_idx == 0,
-    #                     (t-1, u, blank_index),  # blank
-    #                     (t, u-1, labels[u-1])   # emit
-    #                     )
-    # bt_mat[:, n-1, :n] = best_sel
-
     new_diagonal = new_diagonal[:, :n]
     print_debug(n, "new_diagonal", new_diagonal)
     alphas.append(new_diagonal)  # s.t. alphas[n] == new_diagonal
+
+    # for alignment generation
+    argmax_idx = np.argmax([blank, y], axis=0)[:, :n]  # (B, n|U) -> [2], 0: blank, 1: emit
+    print_debug(n, colored("argmax-idx", "cyan"), argmax_idx)
+    max_len = np.minimum(n-1, max_target-1)
+    # assert argmax_idx.shape[1] == max_len
+    u_ranged = np.tile(np.arange(1, max_len+1)[None], [n_batch, 1])  # [B, n|U]
+    print_debug(n, colored("u_ranged", "cyan"), u_ranged)
+    u_ranged_1 = u_ranged - 1
+    blank_tiled = np.tile([[blank_index]], [n_batch, 1])  # [B, 1]
+
+    print_debug(n, colored("labels_shifted", "cyan"), labels_shifted)
+    stack_blank_sel = np.stack([u_ranged, np.tile(blank_tiled, [1, max_len])], axis=-1)  # [B, n|U, 2]
+    first_blank = np.tile([[[0, blank_index]]], [n_batch, 1, 1])
+    stack_blank_sel = np.concatenate([stack_blank_sel, first_blank], axis=1)  # [B, n-1|U, 2] ; [B, 1, 2] -> [B, n|U, 2]
+    print_debug(n, colored("stack_blank_sel", "cyan"), stack_blank_sel)
+
+    stack_emit_sel = np.stack([u_ranged_1, labels_shifted], axis=-1)
+    first_emit_u = np.tile([[0]], [n_batch, 1])  # [B, 1]
+    first_emit_labels = np.expand_dims(labels_shifted[:, 0], axis=1)  # [B, 1]
+    first_emit = np.stack([first_emit_u, first_emit_labels], axis=-1)  # [B, 1, 2]
+    stack_emit_sel = np.concatenate([first_emit, stack_emit_sel], axis=1)
+    print_debug(n, colored("stack_emit_sel", "cyan"), stack_emit_sel)
+
+    # based on the argmax indices, we either store for:
+    # blank: (u,   blank-idx)
+    # emit : (u-1, labels[u-1])
+    best_sel = np.where((argmax_idx == 0)[..., None],
+                        stack_blank_sel,  # blank
+                        stack_emit_sel   # emit
+                        )
+    print_debug(n, colored("best_sel", "cyan"), best_sel)
+    # bt_mat[n]: (B, U|n, 2)
+    bt_mat[n-1, :, :n] = best_sel
 
     if debug:
       print("\n")
@@ -397,7 +425,10 @@ def numpy_forward_shifted_batched(log_probs, labels, blank_index, input_lens, la
       print("FINAL i=%d" % i, "a=%.3f + b=%.3f" % (a, b))
     nll = a + b
     list_nll.append(nll)
-  return ComputationResult("NumPy Batched", costs=np.array(list_nll))
+  alignments = None
+  if with_alignment:
+    alignments = backtrack_alignment_rnnt_numpy_batched(bt_mat, input_lens, label_lens, blank_index=blank_index)
+  return ComputationResult("NumPy Batched", costs=np.array(list_nll), alignments=alignments)
 
 
 def tf_shift_logprobs(mat, axis):
@@ -786,6 +817,34 @@ def test_alignment_score(seed):
   print("Log      score :", result.costs)
   score_ref = transduce_ref(log_probs, labels, blank=blank_index)
   print("Reference score:", -score_ref[0])
+
+
+def test_alignment_batched():
+  """Test the alignment generation for the batched case.
+  This is especially important for seqs of different lengths,
+  this case is not trivial for the backtracking (easy to make mistakes)."""
+  n_time = 20
+  n_target = 8
+  n_vocab = 5
+  blank_index = 0
+  n_batch = 1
+  np.random.seed(42)
+  acts = np.random.random((n_batch, n_time, n_target + 1, n_vocab))
+  labels = np.random.randint(1, n_vocab, size=(n_batch, n_target,))
+  print("labels", labels.tolist())
+  log_probs = log_softmax(acts, axis=-1)
+  input_lens = np.array([n_time])
+  label_lens = np.array([n_target])
+  result_single = numpy_forward(log_probs[0], labels[0], blank_index=blank_index,
+                                debug=False, with_alignment=True)
+  result = numpy_forward_shifted_batched(log_probs, labels, blank_index=blank_index,
+                                         input_lens=input_lens, label_lens=label_lens,
+                                         debug=True, with_alignment=True)
+  print("Score", result.costs)
+  print("Batched Alignment", result.alignments[0], "(len %r)" % len(result.alignments[0]))
+  print("Single  Alignment", result_single.alignments, "(len %r)" % len(result_single.alignments))
+  nonzero_alignment = result.alignments[result.alignments != blank_index]
+  # np.testing.assert_equal(nonzero_alignment, labels)
 
 
 def test_small():
