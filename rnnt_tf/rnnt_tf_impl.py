@@ -397,7 +397,7 @@ def numpy_forward_shifted_batched(log_probs, labels, blank_index, input_lens, la
     # stack_blank_sel = np.concatenate([stack_blank_sel, first_blank], axis=1)  # [B, n-1|U, 2] ; [B, 1, 2] -> [B, n|U, 2]
     print_debug(n, colored("stack_blank_sel", "cyan"), stack_blank_sel)
 
-    labels_emit_sel = labels[np.arange(n_batch), np.maximum(0, np.arange(max_len_diag)[np.newaxis, :]-1)]
+    labels_emit_sel = labels[np.arange(n_batch)[:, np.newaxis], np.maximum(0, np.arange(max_len_diag)[np.newaxis, :]-1)]
     stack_emit_sel = np.stack([u_ranged_1, labels_emit_sel], axis=-1)
     # first_emit_u = np.tile([[0]], [n_batch, 1])  # [B, 1]
     # first_emit_labels = np.expand_dims(labels_shifted[:, 0], axis=1)  # [B, 1]
@@ -474,7 +474,7 @@ def tf_shift_logprobs(mat, axis):
 
 
 def tf_forward_shifted(log_probs, labels, input_lengths=None, label_lengths=None,
-                       blank_index=0, debug=False) -> tf.Tensor:
+                       blank_index=0, debug=False, with_alignment=False) -> tf.Tensor:
   """
   Computes the batched forward pass of the RNN-T model.
   B: batch, T: time, U:target/labels, V: vocabulary
@@ -634,7 +634,7 @@ def tf_forward_shifted(log_probs, labels, input_lengths=None, label_lengths=None
 
 
 def wrap_tf_rnnt(log_probs, labels, input_lengths=None, label_lengths=None,
-                 blank_index=0, debug=False) -> ComputationResult:
+                 blank_index=0, debug=False, with_alignment=False) -> ComputationResult:
   with sess.as_default():
     with tf.name_scope("rnnt_loss"):
       labels_ph = tf.compat.v1.placeholder(tf.int32, [None, None])
@@ -642,17 +642,31 @@ def wrap_tf_rnnt(log_probs, labels, input_lengths=None, label_lengths=None,
       input_lengths_ph = tf.compat.v1.placeholder(tf.int32, [None])
       label_lengths_ph = tf.compat.v1.placeholder(tf.int32, [None])
 
-      costs_ph = tf_forward_shifted(log_probs_ph, labels_ph,
+      res_ph = tf_forward_shifted(log_probs_ph, labels_ph,
                                     input_lengths=input_lengths_ph,
                                     label_lengths=label_lengths_ph,
-                                    blank_index=blank_index, debug=debug)
+                                    blank_index=blank_index, debug=debug,
+                                    with_alignment=with_alignment)
+      if with_alignment:
+        costs_ph, alignments_ph = res_ph
+      else:
+        costs_ph = res_ph
       grads_ph = tf.gradients(xs=log_probs_ph, ys=[-costs_ph])[0]
-      costs_tf, grads_tf = sess.run([costs_ph, grads_ph],
-                                    feed_dict={log_probs_ph: log_probs,
-                                               labels_ph: labels,
-                                               input_lengths_ph: input_lengths,
-                                               label_lengths_ph: label_lengths})
-      return ComputationResult("Pure Tensorflow", costs=costs_tf, grads=grads_tf)
+      fetches = [costs_ph, grads_ph]
+      if with_alignment:
+        fetches += [alignments_ph]
+      fetches_result = sess.run(fetches,
+                                                   feed_dict={log_probs_ph: log_probs,
+                                                              labels_ph: labels,
+                                                              input_lengths_ph: input_lengths,
+                                                              label_lengths_ph: label_lengths})
+      if with_alignment:
+        costs_tf, grads_tf, alignments_tf = fetches_result
+      else:
+        costs_tf, grads_tf = fetches_result
+        alignments_tf = None
+      return ComputationResult("Pure Tensorflow", costs=costs_tf, grads=grads_tf,
+                               alignments=alignments_tf)
 
 
 def wrap_ref_rnnt(log_probs, labels, input_lens, label_lens, blank_index) -> ComputationResult:
@@ -663,12 +677,10 @@ def wrap_ref_rnnt(log_probs, labels, input_lens, label_lens, blank_index) -> Com
   for i in range(n_batch):
     cost_ref, grads_ref = transduce_ref(log_probs[i, :input_lens[i] + 1, :label_lens[i] + 1], labels[i, :label_lens[i]],
                                         blank=blank_index)
-    # np.testing.assert_almost_equal(cost_numpy, cost_ref)
     list_ll.append(-cost_ref)
     list_grads.append(grads_ref)
   costs_ref = np.stack(list_ll, axis=0)
-  grads_ref = np.stack(list_grads, axis=0)
-  return ComputationResult("Reference", costs=costs_ref, grads=grads_ref)
+  return ComputationResult("Reference", costs=costs_ref, grads=list_grads)
 
 
 def wrap_numpy_rnnt(log_probs, labels, input_lens, label_lens, blank_index, debug=False,
