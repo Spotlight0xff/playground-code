@@ -260,7 +260,7 @@ def backtrack_alignment_rnnt_numpy_batched(bt_mat, input_lens, label_lens, blank
   assert track_dim == 2  # (from_u, label)
   # (B, T+U+1) -> [V]
   # alignments[:, 0] should be blank, because in RNN-T we initially consume a frame, then we can emit.
-  alignments = np.ones((n_batch, max_path), dtype=np.int32) * 0 #blank_index
+  alignments = np.ones((n_batch, max_path), dtype=np.int32) * blank_index
   print("#diagonals:", max_path, "B=%r" % n_batch, "U=%r" % max_target, "D=%r" % track_dim)
   print("bt-mat:", bt_mat.shape)
   idx = bt_mat[max_path-1, :, -2]  # (2,)  # we don't actually use this.
@@ -278,7 +278,7 @@ def backtrack_alignment_rnnt_numpy_batched(bt_mat, input_lens, label_lens, blank
     print("s=%r, cond=%r" % (s, cond.tolist()[0]))
     print("s=%r, init-u=%r, idx=%r, align=%r" % (s, init_u[0], idx[0].tolist(), write_align[0].tolist()))
     print("s=%r, bt_mat:" % s, bt_mat[s])
-    alignments[:, s-1] = write_align  # [B]
+    alignments[:, s] = write_align  # [B]
   return alignments
 
 
@@ -375,24 +375,25 @@ def numpy_forward_shifted_batched(log_probs, labels, blank_index, input_lens, la
     # for alignment generation
     argmax_idx = np.argmax([blank, y], axis=0)[:, :n]  # (B, n|U) -> [2], 0: blank, 1: emit
     print_debug(n, colored("argmax-idx", "cyan"), argmax_idx)
-    max_len = np.minimum(n-1, max_target-1)
+    max_len_diag = min(n, max_target)
     # assert argmax_idx.shape[1] == max_len
-    u_ranged = np.tile(np.arange(1, max_len+1)[None], [n_batch, 1])  # [B, n|U]
+    u_ranged = np.tile(np.arange(max_len_diag)[None], [n_batch, 1])  # [B, n|U]
     print_debug(n, colored("u_ranged", "cyan"), u_ranged)
-    u_ranged_1 = u_ranged - 1
+    u_ranged_1 = u_ranged - 1  # for emit, u-1 for every item in the diagonal
     blank_tiled = np.tile([[blank_index]], [n_batch, 1])  # [B, 1]
 
     print_debug(n, colored("labels_shifted", "cyan"), labels_shifted)
-    stack_blank_sel = np.stack([u_ranged, np.tile(blank_tiled, [1, max_len])], axis=-1)  # [B, n|U, 2]
-    first_blank = np.tile([[[0, blank_index]]], [n_batch, 1, 1])
-    stack_blank_sel = np.concatenate([stack_blank_sel, first_blank], axis=1)  # [B, n-1|U, 2] ; [B, 1, 2] -> [B, n|U, 2]
+    stack_blank_sel = np.stack([u_ranged, np.tile(blank_tiled, [1, max_len_diag])], axis=-1)  # [B, n|U, 2]
+    # first_blank = np.tile([[[0, blank_index]]], [n_batch, 1, 1])
+    # stack_blank_sel = np.concatenate([stack_blank_sel, first_blank], axis=1)  # [B, n-1|U, 2] ; [B, 1, 2] -> [B, n|U, 2]
     print_debug(n, colored("stack_blank_sel", "cyan"), stack_blank_sel)
 
-    stack_emit_sel = np.stack([u_ranged_1, labels_shifted], axis=-1)
-    first_emit_u = np.tile([[0]], [n_batch, 1])  # [B, 1]
-    first_emit_labels = np.expand_dims(labels_shifted[:, 0], axis=1)  # [B, 1]
-    first_emit = np.stack([first_emit_u, first_emit_labels], axis=-1)  # [B, 1, 2]
-    stack_emit_sel = np.concatenate([first_emit, stack_emit_sel], axis=1)
+    labels_emit_sel = labels[np.arange(n_batch), np.maximum(0, np.arange(max_len_diag)[np.newaxis, :]-1)]
+    stack_emit_sel = np.stack([u_ranged_1, labels_emit_sel], axis=-1)
+    # first_emit_u = np.tile([[0]], [n_batch, 1])  # [B, 1]
+    # first_emit_labels = np.expand_dims(labels_shifted[:, 0], axis=1)  # [B, 1]
+    # first_emit = np.stack([first_emit_u, first_emit_labels], axis=-1)  # [B, 1, 2]
+    # stack_emit_sel = np.concatenate([first_emit, stack_emit_sel], axis=1)
     print_debug(n, colored("stack_emit_sel", "cyan"), stack_emit_sel)
 
     # based on the argmax indices, we either store for:
