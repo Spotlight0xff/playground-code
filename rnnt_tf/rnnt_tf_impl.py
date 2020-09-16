@@ -675,7 +675,9 @@ def wrap_ref_rnnt(log_probs, labels, input_lens, label_lens, blank_index) -> Com
   list_grads = []
   n_batch = log_probs.shape[0]
   for i in range(n_batch):
-    cost_ref, grads_ref = transduce_ref(log_probs[i, :input_lens[i] + 1, :label_lens[i] + 1], labels[i, :label_lens[i]],
+    log_probs_i = log_probs[i, :input_lens[i], :label_lens[i]+1, :]
+    labels_i = labels[i, :label_lens[i]]
+    cost_ref, grads_ref = transduce_ref(log_probs_i, labels_i,
                                         blank=blank_index)
     list_ll.append(-cost_ref)
     list_grads.append(grads_ref)
@@ -688,14 +690,17 @@ def wrap_numpy_rnnt(log_probs, labels, input_lens, label_lens, blank_index, debu
   """Wraps the numpy debug implementation in our format for comparison."""
   list_costs = []
   list_alignments = []
+  assert len(log_probs.shape) == 4
   n_batch = log_probs.shape[0]
   for i in range(n_batch):
-    result = numpy_forward(log_probs[i, :input_lens[i] + 1, :label_lens[i] + 1], labels[i, :label_lens[i]],
+    log_probs_i = log_probs[i, :input_lens[i], :label_lens[i]+1, :]
+    labels_i = labels[i, :label_lens[i]]
+    result = numpy_forward(log_probs_i, labels_i,
                            blank_index=blank_index, debug=debug, with_alignment=with_alignment)
     list_costs.append(result.costs)
     list_alignments.append(result.alignments)
   costs = np.stack(list_costs, axis=0)
-  alignments = np.stack(list_alignments, axis=0) if with_alignment else None
+  alignments = list_alignments if with_alignment else None
   return ComputationResult("Numpy", costs=costs, alignments=alignments)
 
 
@@ -747,9 +752,8 @@ def test_impl(name, acts, labels, blank_index, input_lens=None, label_lens=None,
   result_ref = wrap_ref_rnnt(log_probs, labels, input_lens, label_lens, blank_index)
   print(result_ref)
 
-  if with_alignment:
-    result_numpy = wrap_numpy_rnnt(log_probs, labels, input_lens, label_lens, blank_index, debug, with_alignment)
-    print(result_numpy)
+  result_numpy = wrap_numpy_rnnt(log_probs, labels, input_lens, label_lens, blank_index, debug, with_alignment)
+  print(result_numpy)
 
   result_numpy_batched = numpy_forward_shifted_batched(log_probs, labels, blank_index=blank_index,
                                                        input_lens=input_lens, label_lens=label_lens,
@@ -766,13 +770,17 @@ def test_impl(name, acts, labels, blank_index, input_lens=None, label_lens=None,
   # We don't have an alpha-matrix anymore (instead there are diagonals)
   np.testing.assert_almost_equal(result_warp.costs, result_ref.costs, decimal=5)
   print("Warp vs Reference: log posterior", colored("MATCH", "green"))
+
   for i in range(n_batch):
-    np.testing.assert_almost_equal(result_warp.grads[i], result_ref.grads[i], decimal=5)
+    np.testing.assert_almost_equal(result_warp.grads[i, :input_lens[i], :label_lens[i]+1], result_ref.grads[i], decimal=5)
   print("Warp vs Reference: gradients    ", colored("MATCH", "green"))
+
   np.testing.assert_almost_equal(result_tf.costs, result_warp.costs, decimal=5)
   print("TF vs Warp: log posterior       ", colored("MATCH", "green"))
+
   np.testing.assert_almost_equal(result_tf.grads, result_warp.grads, decimal=4)
   print("TF vs Warp: gradients           ", colored("MATCH", "green"))
+
   print()
   return result_tf.costs, result_tf.grads
 
@@ -793,6 +801,27 @@ def test_alignment():
 
   labels = np.array([1, 2])
   test_impl("test_alignment", acts, labels, blank_index, debug=True, with_alignment=True)
+
+
+def compute_path_score_from_alignment(alignment, log_probs, labels, blank_index):
+  """
+  Computes the log-prob score along the given alignment.
+
+  :param np.ndarray alignment: (T+U,) -> [V]
+  :param np.ndarray log_probs: (T, U+1, V)
+  :param np.ndarray labels: (U,) labels
+  :param int blank_index:
+  """
+  t = u = 0
+  summands = []
+  for i, symbol in enumerate(alignment):
+    if symbol == blank_index:
+      t += 1
+      summands.append(log_probs[t-1, u, blank_index])
+    else:
+      u += 1
+      summands.append(log_probs[t, u-1, labels[u-1]])
+  return sum(summands)
 
 
 def test_alignment_score(seed):
@@ -817,20 +846,7 @@ def test_alignment_score(seed):
   print("Alignment", result.alignments, "(len %r)" % len(result.alignments))
   nonzero_alignment = result.alignments[result.alignments != blank_index]
   np.testing.assert_equal(nonzero_alignment, labels)
-  t = u = 0
-  elems = []
-  # elems.append(log_probs[0, 0, blank_index])
-  for i, symbol in enumerate(result.alignments[1:]):
-    if symbol == blank_index:
-      t += 1
-      elems.append(log_probs[t-1, u, blank_index])
-    else:
-      u += 1
-      elems.append(log_probs[t, u-1, labels[u-1]])
-  # elems.append(log_probs[-1, -1, blank_index])
-  # assert t+u == n_time + n_target
-  print(len(elems), t+u, elems)
-  score = sum(elems)
+  score = compute_path_score_from_alignment(result.alignments[1:], log_probs, labels, blank_index=blank_index)
   print("Alignment score:", score)
 
   result_tropical = numpy_forward(log_probs, labels, blank_index=blank_index, debug=False, with_alignment=False,
@@ -850,24 +866,39 @@ def test_alignment_batched():
   n_target = 8
   n_vocab = 5
   blank_index = 0
-  n_batch = 1
+  n_batch = 33
   np.random.seed(42)
   acts = np.random.random((n_batch, n_time, n_target + 1, n_vocab))
   labels = np.random.randint(1, n_vocab, size=(n_batch, n_target,))
   print("labels", labels.tolist())
   log_probs = log_softmax(acts, axis=-1)
-  input_lens = np.array([n_time])
-  label_lens = np.array([n_target])
-  result_single = numpy_forward(log_probs[0], labels[0], blank_index=blank_index,
-                                debug=False, with_alignment=True)
-  result = numpy_forward_shifted_batched(log_probs, labels, blank_index=blank_index,
-                                         input_lens=input_lens, label_lens=label_lens,
-                                         debug=True, with_alignment=True)
-  print("Score", result.costs)
-  print("Batched Alignment", result.alignments[0], "(len %r)" % len(result.alignments[0]))
-  print("Single  Alignment", result_single.alignments, "(len %r)" % len(result_single.alignments))
-  nonzero_alignment = result.alignments[result.alignments != blank_index]
-  # np.testing.assert_equal(nonzero_alignment, labels)
+  label_lens = np.random.randint(1, n_target, (n_batch,))
+  input_lens = label_lens + np.random.randint(0, n_time-n_target, (n_batch,))
+  print("T=%r" % input_lens)
+  print("U=%r" % label_lens)
+  result_batched = numpy_forward_shifted_batched(log_probs, labels, blank_index=blank_index,
+                                                 input_lens=input_lens, label_lens=label_lens,
+                                                 debug=False, with_alignment=True)
+  result_singles = wrap_numpy_rnnt(log_probs, labels, input_lens, label_lens, blank_index=blank_index,
+                                   with_alignment=True)
+  for i in range(n_batch):
+    max_path = input_lens[i] + label_lens[i]
+    alignment_batched = result_batched.alignments[i][:max_path]
+    alignment_single = result_singles.alignments[i]
+    log_probs_i = log_probs[i, :input_lens[i], :label_lens[i]+1, :]
+    labels_i = labels[i, :label_lens[i]]
+    costs_single = numpy_forward(log_probs_i, labels_i, blank_index=blank_index)
+    print("Costs2:", costs_single)
+    path_score_batched = compute_path_score_from_alignment(alignment_batched[1:], log_probs_i, labels_i, blank_index=blank_index)
+    path_score_single = compute_path_score_from_alignment(alignment_single[1:], log_probs_i, labels_i,
+                                                          blank_index=blank_index)
+    print("Score", result_batched.costs[i], result_singles.costs[i])
+    print("Batched Alignment (T=%r, U=%r, score=%.3f)" % (input_lens[i], label_lens[i], path_score_batched),
+          alignment_batched, "(len %r)" % len(alignment_batched))
+    print("Single  Alignment (T=%r, U=%r, score=%.3f)" % (input_lens[i], label_lens[i], path_score_single),
+          alignment_single, "(len %r)" % len(alignment_single))
+    # nonzero_alignment = result.alignments[result.alignments != blank_index]
+    # np.testing.assert_equal(nonzero_alignment, labels[])
 
 
 def test_small():
@@ -1039,6 +1070,27 @@ def test_batched():
   print("TF vs Warp: gradients", colored("MATCH", "green"))
 
 
+def test_batched_big():
+  """
+  Test to
+  :return:
+  """
+  n_time = 20
+  n_target = 8
+  n_vocab = 5
+  blank_index = 0
+  n_batch = 37
+  np.random.seed(42)
+  acts = np.random.random((n_batch, n_time, n_target + 1, n_vocab))
+  labels = np.random.randint(1, n_vocab, size=(n_batch, n_target,))
+  label_lens = np.random.randint(1, n_target, (n_batch,))
+  input_lens = label_lens + np.random.randint(0, n_time-n_target, (n_batch,))  # to ensure T >= U
+  # print("labels", labels.tolist())
+  # print("T=%r" % input_lens)
+  # print("U=%r" % label_lens)
+  test_impl("test_batched_big", acts, labels, blank_index, input_lens, label_lens)
+
+
 if __name__ == '__main__':
   tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.ERROR)
   sess = tf.Session()
@@ -1058,4 +1110,5 @@ if __name__ == '__main__':
   # test_size_t_equal_u()
   # test_blank_idx_nonzero()
   # test_batched()
+  test_batched_big()
   # test_sizes()
