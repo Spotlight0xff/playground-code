@@ -199,7 +199,8 @@ def numpy_forward(log_probs, labels, blank_index, debug=False, with_alignment=Fa
   if with_alignment:
     # alignment_batched = backtrack_alignment_rnnt_numpy_batched(bt_mat[np.newaxis], input_lens=np.array([n_time]),
     #                                                            label_lens=np.array([n_target]), blank_index=blank_index)
-    alignment = backtrack_alignment_rnnt_numpy(bt_mat, n_time=n_time, n_target=n_target, blank_index=blank_index)
+    alignment = backtrack_alignment_rnnt_numpy(bt_mat, n_time=n_time, n_target=n_target,
+                                               blank_index=blank_index, debug=debug)
     # np.testing.assert_equal(alignment, alignment_batched[0])
   log_posterior = alpha[n_time-1, n_target-1] + log_probs[n_time-1, n_target-1, blank_index]
   if debug:
@@ -212,7 +213,7 @@ def numpy_forward(log_probs, labels, blank_index, debug=False, with_alignment=Fa
   return ComputationResult("numpy forward", costs=log_posterior, alphas=alpha, alignments=alignment, grads=None)
 
 
-def backtrack_alignment_rnnt_numpy(bt_mat, n_time, n_target, blank_index):
+def backtrack_alignment_rnnt_numpy(bt_mat, n_time, n_target, blank_index, debug=False):
   """Computes the alignment from the backtracking matrix.
   We do this in a batched fashion so we can compare/copy this directly to TF.
 
@@ -232,13 +233,15 @@ def backtrack_alignment_rnnt_numpy(bt_mat, n_time, n_target, blank_index):
   init_t, init_u = n_time-1, n_target-1
   idx = bt_mat[init_t, init_u]  # (from_t, from_u, symbol)
   alignments = [idx[2]]
-  print("bt-mat:", bt_mat.shape)
-  print("bt-mat[%r, %r] = intial-idx = %r" % (init_t, init_u, idx))
+  if debug:
+    print("bt-mat:", bt_mat.shape)
+    print("bt-mat[%r, %r] = intial-idx = %r" % (init_t, init_u, idx))
   for s in reversed(range(1, n_time + n_target-1)):  # every path is T+U long.
     assert idx.shape == (3,)
     t = idx[0]  # time
     u = idx[1]  # target
-    print("[np] s=%2d | t=%2d u=%2d, idx=" % (s, t, u), idx)
+    if debug:
+      print("[np] s=%2d | t=%2d u=%2d, idx=" % (s, t, u), idx)
     idx = bt_mat[t, u]
     alignments.insert(0, idx[2])
     # We backtrack from the end, but the end may be different for each seq in the batch.
@@ -247,7 +250,7 @@ def backtrack_alignment_rnnt_numpy(bt_mat, n_time, n_target, blank_index):
   return np.array(alignments)
 
 
-def backtrack_alignment_rnnt_numpy_batched(bt_mat, input_lens, label_lens, blank_index):
+def backtrack_alignment_rnnt_numpy_batched(bt_mat, input_lens, label_lens, blank_index, debug=False):
   """Computes the alignment from the backtracking matrix.
   We do this in a batched fashion so we can compare/copy this directly to TF.
 
@@ -265,8 +268,9 @@ def backtrack_alignment_rnnt_numpy_batched(bt_mat, input_lens, label_lens, blank
   # (B, T+U+1) -> [V]
   # alignments[:, 0] should be blank, because in RNN-T we initially consume a frame, then we can emit.
   alignments = np.ones((n_batch, max_path), dtype=np.int32) * blank_index
-  print("#diagonals:", max_path, "B=%r" % n_batch, "U=%r" % max_target, "D=%r" % track_dim)
-  print("bt-mat:", bt_mat.shape)
+  if debug:
+    print("#diagonals:", max_path, "B=%r" % n_batch, "U=%r" % max_target, "D=%r" % track_dim)
+    print("bt-mat:", bt_mat.shape)
   idx = bt_mat[max_path-1, :, -2]  # (2,)  # we don't actually use this.
   assert bt_mat.shape[0] == max_path
   for s in reversed(range(1, max_path)):  # every path is T+U long.
@@ -279,9 +283,10 @@ def backtrack_alignment_rnnt_numpy_batched(bt_mat, input_lens, label_lens, blank
     idx = bt_mat[s, np.arange(n_batch), init_u]
     assert idx.shape == (n_batch, 2), init_u.shape
     write_align = np.where(s <= input_lens+label_lens, idx[:, 1], -1)
-    print("s=%r, cond=%r" % (s, cond.tolist()[0]))
-    print("s=%r, init-u=%r, idx=%r, align=%r" % (s, init_u[0], idx[0].tolist(), write_align[0].tolist()))
-    print("s=%r, bt_mat:" % s, bt_mat[s])
+    if debug:
+      print("s=%r, cond=%r" % (s, cond.tolist()[0]))
+      print("s=%r, init-u=%r, idx=%r, align=%r" % (s, init_u[0], idx[0].tolist(), write_align[0].tolist()))
+      print("s=%r, bt_mat:" % s, bt_mat[s])
     alignments[:, s] = write_align  # [B]
   return alignments
 
@@ -432,7 +437,8 @@ def numpy_forward_shifted_batched(log_probs, labels, blank_index, input_lens, la
     list_nll.append(nll)
   alignments = None
   if with_alignment:
-    alignments = backtrack_alignment_rnnt_numpy_batched(bt_mat, input_lens, label_lens, blank_index=blank_index)
+    alignments = backtrack_alignment_rnnt_numpy_batched(bt_mat, input_lens, label_lens,
+                                                        blank_index=blank_index, debug=debug)
   return ComputationResult("NumPy Batched", costs=np.array(list_nll), alignments=alignments)
 
 
@@ -665,7 +671,7 @@ def wrap_ref_rnnt(log_probs, labels, input_lens, label_lens, blank_index) -> Com
   return ComputationResult("Reference", costs=costs_ref, grads=grads_ref)
 
 
-def wrap_numpy_rnnt(log_probs, labels, input_lens, label_lens, blank_index, debug=True,
+def wrap_numpy_rnnt(log_probs, labels, input_lens, label_lens, blank_index, debug=False,
                     with_alignment=False) -> ComputationResult:
   """Wraps the numpy debug implementation in our format for comparison."""
   list_costs = []
