@@ -9,5 +9,11 @@
     <mapping directory="$PROJECT_DIR$/rnnt_tf/returnn/extern/blocksparse" vcs="Git" />
     <mapping directory="$PROJECT_DIR$/rnnt_tf/returnn/extern/kenlm" vcs="Git" />
     <mapping directory="$PROJECT_DIR$/rnnt_tf/returnn/extern/openfst" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/rnnt_tf/returnn/returnn/extern/HawkAaronWarpTransducer/warp-transducer" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/rnnt_tf/returnn/returnn/extern/HawkAaronWarpTransducer/warp-transducer/mxnet_binding" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/rnnt_tf/returnn/returnn/extern/ParseOggVorbis" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/rnnt_tf/returnn/returnn/extern/blocksparse" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/rnnt_tf/returnn/returnn/extern/kenlm" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/rnnt_tf/returnn/returnn/extern/openfst" vcs="Git" />
   </component>
 </project>

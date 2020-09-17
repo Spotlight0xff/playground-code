@@ -7,13 +7,10 @@
       <sourceFolder url="file://$MODULE_DIR$/rnnt_tf" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/rnnt_tf/returnn/tests" isTestSource="false" />
     </content>
-    <orderEntry type="jdk" jdkName="Python 3.6 (returnn)" jdkType="Python SDK" />
+    <orderEntry type="jdk" jdkName="Python 3.8 (master-thesis)" jdkType="Python SDK" />
     <orderEntry type="sourceFolder" forTests="false" />
   </component>
   <component name="PyDocumentationSettings">
     <option name="renderExternalDocumentation" value="true" />
-  </component>
-  <component name="TestRunnerService">
-    <option name="PROJECT_TEST_RUNNER" value="Unittests" />
   </component>
 </module>
