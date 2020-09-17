@@ -464,7 +464,7 @@ def backtrack_alignment_tf(bt_ta, input_lengths, label_lengths, blank_index):
   n_batch = tf.shape(input_lengths)[0]
   alignments_ta = tf.TensorArray(
     dtype=tf.int32,
-    size=max_path+1,
+    size=max_path,
     dynamic_size=False,
     infer_shape=False,
     element_shape=(None,),
@@ -476,10 +476,6 @@ def backtrack_alignment_tf(bt_ta, input_lengths, label_lengths, blank_index):
     backtrack = bt_ta.read(s)  # (B, U, 2)
 
     cond = tf.greater_equal(s, input_lengths + label_lengths - 1)
-    print_op = tf.print("i=", 8, "s=", s, "cond=", cond[8], "bt=\n", backtrack[8],
-                        summarize=-1, output_stream=sys.stdout)
-    with tf.control_dependencies([print_op]):
-      backtrack = tf.identity(backtrack)
 
     init_u = tf.where(cond,
                       label_lengths,  # if we are at the end of some path (or behind)
@@ -493,14 +489,15 @@ def backtrack_alignment_tf(bt_ta, input_lengths, label_lengths, blank_index):
     idx = tf.gather_nd(backtrack, backtrack_indices)
     idx.set_shape((None, 2))  # TODO: or use shape_invariants arg of while_loop
 
-    alignments = alignments.write(s+1, tf.where(
-      tf.less_equal(tf.tile([s], [n_batch]), input_lengths+label_lengths),
+    align_write = tf.where(
+      tf.less_equal(s, input_lengths + label_lengths),
       idx[:, 1],
-      tf.ones((n_batch,), dtype=tf.int32) * -1))
+      tf.ones((n_batch,), dtype=tf.int32) * -1)
+    alignments = alignments.write(s, align_write)
 
     return s-1, alignments, idx
   init_s = max_path-1
-  final_s, final_alignments_ta, final_idx = tf.while_loop(lambda s, *args: tf.greater_equal(s, 0),
+  final_s, final_alignments_ta, final_idx = tf.while_loop(lambda s, *args: tf.greater_equal(s, 1),
                                                           body, (init_s, alignments_ta, initial_idx))
   final_alignments_ta = final_alignments_ta.write(0, tf.tile([blank_index], [n_batch]))
   return tf.transpose(final_alignments_ta.stack())
@@ -689,7 +686,7 @@ def rnnt_loss(log_probs, labels, input_lengths=None, label_lengths=None,
                           stack_blank_sel,  # blank
                           stack_emit_sel  # emit
                           )
-      backtrack_ta = backtrack_ta.write(n-2, best_sel)
+      backtrack_ta = backtrack_ta.write(n-1, best_sel)
     else:
       backtrack_ta = None
     return [n + 1, alpha_ta.write(n, new_diagonal), backtrack_ta]
