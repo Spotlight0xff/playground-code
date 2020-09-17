@@ -11,7 +11,7 @@ import numpy as np
 from termcolor import colored
 from ref_transduce import transduce as transduce_ref
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "returnn"))
-from returnn.extern.HawkAaronWarpTransducer import warp_rnnt_loss
+from returnn.extern.HawkAaronWarpTransducer import rnnt_loss as warp_rnnt_loss
 from returnn.tf.compat import v1 as tf
 NEG_INF = -float("inf")
 
