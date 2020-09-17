@@ -13,7 +13,7 @@ import numpy as np
 from termcolor import colored
 from ref_transduce import transduce as transduce_ref
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "returnn"))
-from returnn.extern.HawkAaronWarpTransducer import rnnt_loss
+from returnn.extern.HawkAaronWarpTransducer import warp_rnnt_loss
 from returnn.tf.compat import v1 as tf
 NEG_INF = -float("inf")
 
@@ -40,7 +40,7 @@ class ComputationResult(object):
       grads_msg = "%.4f" % sum([np.linalg.norm(grad) for grad in grads])
     ret = "%20s implementation: log-posterior=%.3f, |grads|=%s" % (colored("%20s" % self.name, "red"), cost, grads_msg)
     if self.alignments is not None:
-      ret += " alignment[0]=%r" % self.alignments[0]
+      ret += " with alignment"
     return ret
 
 
@@ -199,6 +199,7 @@ def numpy_forward(log_probs, labels, blank_index, debug=False, with_alignment=Fa
   if with_alignment:
     # alignment_batched = backtrack_alignment_rnnt_numpy_batched(bt_mat[np.newaxis], input_lens=np.array([n_time]),
     #                                                            label_lens=np.array([n_target]), blank_index=blank_index)
+    # bt_mat[n_time, n_target-1] = (n_time-1, n_target-1, blank_index)
     alignment = backtrack_alignment_rnnt_numpy(bt_mat, n_time=n_time, n_target=n_target,
                                                blank_index=blank_index, debug=debug)
     # np.testing.assert_equal(alignment, alignment_batched[0])
@@ -240,10 +241,11 @@ def backtrack_alignment_rnnt_numpy(bt_mat, n_time, n_target, blank_index, debug=
     assert idx.shape == (3,)
     t = idx[0]  # time
     u = idx[1]  # target
-    if debug:
-      print("[np] s=%2d | t=%2d u=%2d, idx=" % (s, t, u), idx)
+    # if True:
+    #   print("[np] s=%2d | t=%2d u=%2d, idx=" % (s, t, u), idx)
     idx = bt_mat[t, u]
     alignments.insert(0, idx[2])
+  # assert t == u == 0
     # We backtrack from the end, but the end may be different for each seq in the batch.
     # Thus we need to ensure that we start at the correct end-point for each seq.
   # alignments.insert(0, idx[2])
@@ -271,10 +273,15 @@ def backtrack_alignment_rnnt_numpy_batched(bt_mat, input_lens, label_lens, blank
   if debug:
     print("#diagonals:", max_path, "B=%r" % n_batch, "U=%r" % max_target, "D=%r" % track_dim)
     print("bt-mat:", bt_mat.shape)
-  idx = bt_mat[max_path-1, :, -2]  # (2,)  # we don't actually use this.
+  idx = np.zeros((n_batch, 2), dtype=np.int32)
   assert bt_mat.shape[0] == max_path
   for s in reversed(range(1, max_path)):  # every path is T+U long.
     cond = np.greater_equal(s, input_lens+label_lens-1)
+    print("i=8, s=%d, cond=%r, bt=" % (s, cond[8]))
+    print(bt_mat[s, 8])
+    # print_op = tf.print("i=", 8, "s=", s, "cond=", cond[8], "bt=\n", backtrack[8],
+    #                     summarize=-1, output_stream=sys.stdout)
+
     init_u = np.where(cond,
                       label_lens,  # if we are at the end of some path (or behind)
                       idx[:, 0]  # if we are within a path, continue backtracking.
@@ -442,6 +449,63 @@ def numpy_forward_shifted_batched(log_probs, labels, blank_index, input_lens, la
   return ComputationResult("NumPy Batched", costs=np.array(list_nll), alignments=alignments)
 
 
+def backtrack_alignment_tf(bt_ta, input_lengths, label_lengths, blank_index):
+  """Computes the alignment from the backtracking matrix.
+  :param tf.TensorArray bt_ta: [T+U] * (B, U, 2)
+  :param tf.Tensor input_lengths: (B,)
+  :param tf.Tensor label_lengths: (B,)
+  :param int blank_index:
+  """
+  # shape = tf.shape(bt_mat)
+  # bt_ta: tf.TensorArray
+  #
+  max_path = bt_ta.size()
+
+  n_batch = tf.shape(input_lengths)[0]
+  alignments_ta = tf.TensorArray(
+    dtype=tf.int32,
+    size=max_path+1,
+    dynamic_size=False,
+    infer_shape=False,
+    element_shape=(None,),
+    name="alignments"
+  )
+  initial_idx = tf.zeros((n_batch, 2), dtype=tf.int32)
+
+  def body(s, alignments, idx):
+    backtrack = bt_ta.read(s)  # (B, U, 2)
+
+    cond = tf.greater_equal(s, input_lengths + label_lengths - 1)
+    print_op = tf.print("i=", 8, "s=", s, "cond=", cond[8], "bt=\n", backtrack[8],
+                        summarize=-1, output_stream=sys.stdout)
+    with tf.control_dependencies([print_op]):
+      backtrack = tf.identity(backtrack)
+
+    init_u = tf.where(cond,
+                      label_lengths,  # if we are at the end of some path (or behind)
+                      idx[:, 0]  # if we are within a path, continue backtracking.
+                      )
+
+    backtrack_indices = tf.stack([
+      tf.range(n_batch),
+      init_u
+    ], axis=-1)  # (B, 2)
+    idx = tf.gather_nd(backtrack, backtrack_indices)
+    idx.set_shape((None, 2))  # TODO: or use shape_invariants arg of while_loop
+
+    alignments = alignments.write(s+1, tf.where(
+      tf.less_equal(tf.tile([s], [n_batch]), input_lengths+label_lengths),
+      idx[:, 1],
+      tf.ones((n_batch,), dtype=tf.int32) * -1))
+
+    return s-1, alignments, idx
+  init_s = max_path-1
+  final_s, final_alignments_ta, final_idx = tf.while_loop(lambda s, *args: tf.greater_equal(s, 0),
+                                                          body, (init_s, alignments_ta, initial_idx))
+  final_alignments_ta = final_alignments_ta.write(0, tf.tile([blank_index], [n_batch]))
+  return tf.transpose(final_alignments_ta.stack())
+
+
 def tf_shift_logprobs(mat, axis):
   """
   Shifts the log-probs per-batch row-wise.
@@ -473,8 +537,8 @@ def tf_shift_logprobs(mat, axis):
   return t
 
 
-def tf_forward_shifted(log_probs, labels, input_lengths=None, label_lengths=None,
-                       blank_index=0, debug=False, with_alignment=False) -> tf.Tensor:
+def rnnt_loss(log_probs, labels, input_lengths=None, label_lengths=None,
+              blank_index=0, debug=False, with_alignment=False):
   """
   Computes the batched forward pass of the RNN-T model.
   B: batch, T: time, U:target/labels, V: vocabulary
@@ -486,6 +550,8 @@ def tf_forward_shifted(log_probs, labels, input_lengths=None, label_lengths=None
   :param int blank_index: index of the blank symbol in the vocabulary
   :param bool debug: enable verbose logging
   :return:
+  with_alignment=True -> (costs, alignments)
+                =False -> costs
   """
   """Pure TF implementation of the RNN-T loss."""
   shape = tf.shape(log_probs)
@@ -523,12 +589,26 @@ def tf_forward_shifted(log_probs, labels, input_lengths=None, label_lengths=None
   )
   alpha_ta = alpha_ta.write(1, tf.zeros((n_batch, 1)))
 
+  if with_alignment:
+    # backtrack matrix, for each diagonal and target -> [from_u, symbol/blank]
+    backtrack_ta = tf.TensorArray(
+      dtype=tf.int32,
+      # size=num_diagonals-2,
+      size=1,
+      dynamic_size=True,
+      infer_shape=False,
+      element_shape=(None, None, 2),
+      name="backtrack"
+    )
+  else:
+    backtrack_ta = None
+
   def cond(n, *args):
     """We run the loop until all elements are covered by diagonals.
     """
     return tf.less(n, num_diagonals)
 
-  def body_forward(n, alpha_ta):
+  def body_forward(n, alpha_ta, backtrack_ta=None):
     """body of the while_loop, loops over the diagonals of the alpha-tensor."""
     # alpha(t-1,u) + logprobs(t-1, u)
     # alpha_blank      + lp_blank
@@ -588,12 +668,36 @@ def tf_forward_shifted(log_probs, labels, input_lengths=None, label_lengths=None
 
     new_diagonal = new_diagonal[:, :n]
     new_diagonal = py_print_iteration_info("new_diagonal", new_diagonal, n, debug=debug)
-    return [n + 1, alpha_ta.write(n, new_diagonal)]
+
+    if backtrack_ta is not None:
+      argmax_idx = tf.argmax([blank, y], axis=0)
+      max_len_diag = tf.minimum(n, max_target)
+      u_ranged = tf.tile(tf.range(max_len_diag)[None], [n_batch, 1])  # (B, n|U)
+      blank_tiled = tf.tile([[blank_index]], [n_batch, 1])
+
+      stack_blank_sel = tf.stack([u_ranged, tf.tile(blank_tiled, [1, max_len_diag])], axis=-1)
+
+      b, r = tf.meshgrid(
+        tf.range(n_batch),
+        tf.maximum(0, tf.range(max_len_diag) - 1),
+        indexing='ij'
+      )
+      labels_idxs = tf.stack([b, r], axis=-1)
+      labels_emit_sel = tf.gather_nd(labels, labels_idxs)  # (B, n)  labels[u-1]
+      stack_emit_sel = tf.stack([u_ranged-1, labels_emit_sel], axis=-1)
+      best_sel = tf.where(tf.tile(tf.equal(argmax_idx, 0)[..., None], [1, 1, 2]),
+                          stack_blank_sel,  # blank
+                          stack_emit_sel  # emit
+                          )
+      backtrack_ta = backtrack_ta.write(n-2, best_sel)
+    else:
+      backtrack_ta = None
+    return [n + 1, alpha_ta.write(n, new_diagonal), backtrack_ta]
 
   n = tf.constant(2)
-  final_n, alpha_out_ta = tf.while_loop(cond, body_forward, [n, alpha_ta],
-                                        parallel_iterations=1,  # need this due to the iterative computation using TAs
-                                        name="rnnt")
+  final_n, alpha_out_ta, backtrack_out_ta = tf.while_loop(cond, body_forward, [n, alpha_ta, backtrack_ta],
+                                                          parallel_iterations=1,  # iterative computation
+                                                          name="rnnt")
 
   # p(y|x) = alpha(T,U) * blank(T,U)  (--> in log-space)
   # ll_tf = final_alpha[n_time-1, n_target-1] + log_probs[n_time-1, n_target-1, blank_index]
@@ -630,7 +734,14 @@ def tf_forward_shifted(log_probs, labels, input_lengths=None, label_lengths=None
     tf.tile([blank_index], [n_batch]),
   ], axis=-1)  # (B, 3)
   ll_tf = a_ta.stack() + tf.gather_nd(log_probs, indices)
-  return ll_tf
+
+  if with_alignment:
+    assert backtrack_out_ta is not None
+    # bt_mat = backtrack_out_ta.stack()  # [T+U, B, U, 2]
+    alignments = backtrack_alignment_tf(backtrack_out_ta, input_lengths, label_lengths, blank_index)
+    return ll_tf, alignments
+  else:
+    return ll_tf
 
 
 def wrap_tf_rnnt(log_probs, labels, input_lengths=None, label_lengths=None,
@@ -642,11 +753,8 @@ def wrap_tf_rnnt(log_probs, labels, input_lengths=None, label_lengths=None,
       input_lengths_ph = tf.compat.v1.placeholder(tf.int32, [None])
       label_lengths_ph = tf.compat.v1.placeholder(tf.int32, [None])
 
-      res_ph = tf_forward_shifted(log_probs_ph, labels_ph,
-                                    input_lengths=input_lengths_ph,
-                                    label_lengths=label_lengths_ph,
-                                    blank_index=blank_index, debug=debug,
-                                    with_alignment=with_alignment)
+      res_ph = rnnt_loss(log_probs_ph, labels_ph, input_lengths=input_lengths_ph, label_lengths=label_lengths_ph,
+                         blank_index=blank_index, debug=debug, with_alignment=with_alignment)
       if with_alignment:
         costs_ph, alignments_ph = res_ph
       else:
@@ -656,10 +764,10 @@ def wrap_tf_rnnt(log_probs, labels, input_lengths=None, label_lengths=None,
       if with_alignment:
         fetches += [alignments_ph]
       fetches_result = sess.run(fetches,
-                                                   feed_dict={log_probs_ph: log_probs,
-                                                              labels_ph: labels,
-                                                              input_lengths_ph: input_lengths,
-                                                              label_lengths_ph: label_lengths})
+                                feed_dict={log_probs_ph: log_probs,
+                                           labels_ph: labels,
+                                           input_lengths_ph: input_lengths,
+                                           label_lengths_ph: label_lengths})
       if with_alignment:
         costs_tf, grads_tf, alignments_tf = fetches_result
       else:
@@ -710,8 +818,8 @@ def wrap_warp_rnnt(log_probs, labels, input_lens, label_lens, blank_index) -> Co
     label_lengths_t = tf.constant(label_lens, dtype=tf.int32)  # (B,)
     log_probs_t = tf.constant(log_probs, dtype=tf.float32)  # (B, T, U, V)
     labels_t = tf.constant(labels, dtype=tf.int32)
-    costs_warprnnt_tf = rnnt_loss(log_probs_t, labels_t,
-                                  input_lengths_t, label_lengths_t, blank_label=blank_index)
+    costs_warprnnt_tf = warp_rnnt_loss(log_probs_t, labels_t,
+                                       input_lengths_t, label_lengths_t, blank_label=blank_index)
     grads_warprnnt_tf = tf.gradients(costs_warprnnt_tf, [log_probs_t])[0]
     costs_warprnnt, grads_warprnnt = sess.run([costs_warprnnt_tf, grads_warprnnt_tf])
     return ComputationResult("Warp Tensorflow", costs=-costs_warprnnt, grads=grads_warprnnt)
@@ -757,13 +865,13 @@ def test_impl(name, acts, labels, blank_index, input_lens=None, label_lens=None,
 
   result_numpy_batched = numpy_forward_shifted_batched(log_probs, labels, blank_index=blank_index,
                                                        input_lens=input_lens, label_lens=label_lens,
-                                                       debug=debug)
+                                                       debug=debug, with_alignment=with_alignment)
   print(result_numpy_batched)
 
   result_warp = wrap_warp_rnnt(log_probs, labels, input_lens, label_lens, blank_index)
   print(result_warp)
 
-  result_tf = wrap_tf_rnnt(log_probs, labels, input_lens, label_lens, blank_index, debug)
+  result_tf = wrap_tf_rnnt(log_probs, labels, input_lens, label_lens, blank_index, debug, with_alignment)
   print(result_tf)
 
   # Do all the tests (ref vs TF), for score, and grads (TF/Ref)
@@ -780,6 +888,20 @@ def test_impl(name, acts, labels, blank_index, input_lens=None, label_lens=None,
 
   np.testing.assert_almost_equal(result_tf.grads, result_warp.grads, decimal=4)
   print("TF vs Warp: gradients           ", colored("MATCH", "green"))
+
+  if with_alignment:
+    for i in range(n_batch):
+      alignment_tf = result_tf.alignments[i, :input_lens[i] + label_lens[i]]
+      alignment_np_batched = result_numpy_batched.alignments[i, :input_lens[i] + label_lens[i]]
+      print("alignments[%2d] NP  :" % i, result_numpy.alignments[i])
+      print("alignments[%2d] NP-b:" % i, alignment_np_batched)
+      print("alignments[%2d] TF-b:" % i, alignment_tf)
+      nonblank_alignment = alignment_tf[alignment_tf != blank_index]
+      np.testing.assert_equal(nonblank_alignment, labels[i][:label_lens[i]])
+      np.testing.assert_almost_equal(alignment_tf,
+                                     result_numpy.alignments[i],
+                                     decimal=5)
+    print("TF vs Numpy: alignments         ", colored("MATCH", "green"))
 
   print()
   return result_tf.costs, result_tf.grads
@@ -814,6 +936,7 @@ def compute_path_score_from_alignment(alignment, log_probs, labels, blank_index)
   """
   t = u = 0
   summands = []
+  # alignment[-1] = 0
   for i, symbol in enumerate(alignment):
     if symbol == blank_index:
       t += 1
@@ -821,6 +944,7 @@ def compute_path_score_from_alignment(alignment, log_probs, labels, blank_index)
     else:
       u += 1
       summands.append(log_probs[t, u-1, labels[u-1]])
+  # summands.append(log_probs[t, u-1, labels[u-1]])
   return sum(summands)
 
 
@@ -843,19 +967,34 @@ def test_alignment_score(seed):
   log_probs = log_softmax(acts, axis=-1)
   result = numpy_forward(log_probs, labels, blank_index=blank_index, debug=False, with_alignment=True,
                          semiring=LogSemiring)
-  print("Alignment", result.alignments, "(len %r)" % len(result.alignments))
+  result_batched = numpy_forward_shifted_batched(log_probs[None], labels[None], blank_index=blank_index,
+                                                 input_lens=np.array([n_time]), label_lens=np.array([n_target]),
+                                                 debug=False, with_alignment=True)
+  result_tf = wrap_tf_rnnt(log_probs[None], labels[None], blank_index=blank_index,
+                           input_lengths=np.array([n_time-1]), label_lengths=np.array([n_target]),
+                           debug=False, with_alignment=True)
+
+  print("Alignment (Numpy)        ", result.alignments, "(len %r)" % len(result.alignments))
+  print("Alignment (Batched Numpy)", result_batched.alignments[0], "(len %r)" % len(result_batched.alignments[0]))
+  print("Alignment (Tensorflow)   ", result_tf.alignments[0], "(len %r)" % len(result_tf.alignments[0]))
   nonzero_alignment = result.alignments[result.alignments != blank_index]
   np.testing.assert_equal(nonzero_alignment, labels)
   score = compute_path_score_from_alignment(result.alignments[1:], log_probs, labels, blank_index=blank_index)
-  print("Alignment score:", score)
+  score_batched = compute_path_score_from_alignment(result_batched.alignments[0, 1:],
+                                                    log_probs, labels, blank_index=blank_index)
+  score_tf = compute_path_score_from_alignment(result_tf.alignments[0, 1:],
+                                               log_probs, labels, blank_index=blank_index)
+  print("Alignment score (Numpy)     :", score)
+  print("Alignment score (Batched Numpy):", score_batched)
+  print("Alignment score (Tensorflow):", score_tf)
 
   result_tropical = numpy_forward(log_probs, labels, blank_index=blank_index, debug=False, with_alignment=False,
                                   semiring=TropicalSemiring)
-  print("Tropical score :", result_tropical.costs)
+  print("Tropical score           :", result_tropical.costs)
 
-  print("Log      score :", result.costs)
+  print("Log      score           :", result.costs)
   score_ref = transduce_ref(log_probs, labels, blank=blank_index)
-  print("Reference score:", -score_ref[0])
+  print("Reference score          :", -score_ref[0])
 
 
 def test_alignment_batched():
@@ -899,6 +1038,28 @@ def test_alignment_batched():
           alignment_single, "(len %r)" % len(alignment_single))
     # nonzero_alignment = result.alignments[result.alignments != blank_index]
     # np.testing.assert_equal(nonzero_alignment, labels[])
+
+
+def test_alignment_batched_tf():
+  """Test the alignment generation for the batched case.
+  This is especially important for seqs of different lengths,
+  this case is not trivial for the backtracking (easy to make mistakes)."""
+  n_time = 20
+  n_target = 8
+  n_vocab = 5
+  blank_index = 0
+  n_batch = 33
+  np.random.seed(42)
+  acts = np.random.random((n_batch, n_time, n_target + 1, n_vocab))
+  labels = np.random.randint(1, n_vocab, size=(n_batch, n_target,))
+  print("labels", labels.tolist())
+  # log_probs = log_softmax(acts, axis=-1)
+  label_lens = np.random.randint(1, n_target, (n_batch,))
+  input_lens = label_lens + np.random.randint(0, n_time-n_target, (n_batch,))
+  print("T=%r" % input_lens)
+  print("U=%r" % label_lens)
+  test_impl("test_alignment_batched_tf", acts, labels, blank_index,
+            input_lens, label_lens, debug=False, with_alignment=True)
 
 
 def test_small():
@@ -1103,12 +1264,13 @@ if __name__ == '__main__':
   # for seed in range(42):
   #   test_alignment_score(seed)
   # test_alignment_score(7)
-  test_alignment_batched()
+  # test_alignment_batched()
+  test_alignment_batched_tf()
   # test_small()
   # test_size_u_greater_t()
   # test_size_t_greater_u()
   # test_size_t_equal_u()
   # test_blank_idx_nonzero()
   # test_batched()
-  test_batched_big()
+  # test_batched_big()
   # test_sizes()
