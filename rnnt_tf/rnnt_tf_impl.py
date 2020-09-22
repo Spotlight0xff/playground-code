@@ -292,7 +292,7 @@ def rnnt_loss(log_probs, labels, input_lengths=None, label_lengths=None,
     return i+1, res_loop_ta.write(i, ta_item[within_diag_idx[i]])
 
   final_i, a_ta = tf.while_loop(
-    lambda i, _: i < n_batch,
+    lambda i, _: tf.less(i, n_batch),
     ta_read_body, (tf.constant(0, tf.int32), res_ta)
   )
   indices = tf.stack([
